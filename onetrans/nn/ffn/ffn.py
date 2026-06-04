@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 
+
 class FFN(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
