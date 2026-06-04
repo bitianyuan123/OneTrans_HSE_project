@@ -45,11 +45,10 @@ class MixedCausalSelfAttention(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            sequential_tokens_num: int,
             mask: torch.Tensor
     ) -> torch.Tensor:
         B, total_len, D = x.shape
-        ns_len = total_len - sequential_tokens_num
+        sequential_tokens_num = total_len - self.ns_tokens_num
 
         # по статье все QKV в итоге идут в один multi head attn
         Q = torch.zeros(B, total_len, self.n_heads, self.head_dim, device=x.device)
@@ -68,7 +67,7 @@ class MixedCausalSelfAttention(nn.Module):
 
         # non sequential часть
         ns_tokens = x[:, sequential_tokens_num:, :]
-        for i in range(ns_len):
+        for i in range(self.ns_tokens_num):
             ns_token = ns_tokens[:, i, :]  # (B, D)
             ns_qkv = self.W_ns_list[i](ns_token)  # (B, 3 * D)
             ns_qkv = ns_qkv.reshape(B, 3, self.n_heads, self.head_dim)
