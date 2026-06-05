@@ -80,6 +80,13 @@ class PiecewiseLinearEncoder(nn.Module):
     def n_bins(self):
         return self._n_bins
 
+    @property
+    def out_features(self) -> int:
+        if self.mask is not None:
+            return int(self.mask.sum().item())
+        n_features, max_n_bins = self.weight.shape
+        return n_features * max_n_bins
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, n_features = x.shape
         max_n_bins = self.weight.shape[1]
