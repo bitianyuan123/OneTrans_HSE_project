@@ -139,7 +139,8 @@ class _ModelSpecificDataset(Dataset):
             signal_arrays = []
             for sig in ["is_like", "is_full_play", "is_skip"]:
                 cols = [f"seq_{sig}_{k}" for k in range(1, seq_len + 1)]
-                arr = df.select(cols).fill_null(0).to_numpy()
+                # Явно кастим к float32 и заменяем null на 0
+                arr = df.select(cols).fill_null(0).cast(pl.Float32).to_numpy()
                 signal_arrays.append(arr)
             self.seq_signals = torch.tensor(
                 np.stack(signal_arrays, axis=-1),
