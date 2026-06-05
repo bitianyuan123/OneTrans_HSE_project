@@ -2,8 +2,6 @@ import torch
 from torch import nn
 from torch.nn.functional import embedding_bag
 
-from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
-
 
 def _mlp(in_dim, out_dim):
     return nn.Sequential(
@@ -13,7 +11,7 @@ def _mlp(in_dim, out_dim):
     )
 
 
-def _embed_multivalent(embedding, values, lengths):
+def embed_multivalent(embedding, values, lengths):
     batch_size = lengths.shape[0]
     if values.dim() == 1:
         values = values.unsqueeze(1)
@@ -34,87 +32,87 @@ def _embed_multivalent(embedding, values, lengths):
 
 
 class STokenizer(nn.Module):
-    def __init__(self, d_model, num_items, item_embedding_dim, n_signals=3):
+    def __init__(self, d_model, in_dims, merge="timestamp_aware"):
         super().__init__()
-        self.item_embeddings = nn.Embedding(num_items, item_embedding_dim)
-        self.proj = _mlp(item_embedding_dim + n_signals, d_model)
+        self.n_seq_types = len(in_dims)
+        self.merge = merge
 
-    def forward(self, seq_items, seq_signals, seq_mask):
-        item_emb = self.item_embeddings(seq_items)
-        event_emb = torch.cat([item_emb, seq_signals], dim=-1)
-        tokens = self.proj(event_emb)
-        tokens = tokens * seq_mask.unsqueeze(-1)
-        return tokens, seq_mask
+        self.mlps = nn.ModuleList([_mlp(dim, d_model) for dim in in_dims])
+        self.type_embeddings = nn.Embedding(self.n_seq_types, d_model)
+
+        if merge == "timestamp_agnostic":
+            self.sep_tokens = nn.Parameter(torch.zeros(self.n_seq_types - 1, d_model))
+
+    def _timestamp_aware_merge(self, tokens_list, masks, timestamps):
+        for i in range(self.n_seq_types):
+            tokens_list[i] = tokens_list[i] + self.type_embeddings.weight[i]
+
+        all_tokens = torch.cat(tokens_list, dim=1)
+        all_ts = torch.cat(timestamps, dim=1)
+        all_masks = torch.cat(masks, dim=1)
+
+        sort_ts = all_ts.masked_fill(~all_masks, all_ts.max() + 1)
+        order = sort_ts.argsort(dim=1)
+
+        sorted_tokens = all_tokens.gather(1, order.unsqueeze(-1).expand_as(all_tokens))
+        sorted_mask = all_masks.gather(1, order)
+        sorted_tokens = sorted_tokens * sorted_mask.unsqueeze(-1)
+        return sorted_tokens, sorted_mask
+
+    def _timestamp_agnostic_merge(self, tokens_list, masks):
+        B = tokens_list[0].shape[0]
+        device = tokens_list[0].device
+        parts_t, parts_m = [], []
+        for i, (tokens, mask) in enumerate(zip(tokens_list, masks)):
+            parts_t.append(tokens)
+            parts_m.append(mask)
+            if i < self.n_seq_types - 1:
+                sep = self.sep_tokens[i].unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+                parts_t.append(sep)
+                parts_m.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+
+        all_tokens = torch.cat(parts_t, dim=1)
+        all_masks = torch.cat(parts_m, dim=1)
+        return all_tokens * all_masks.unsqueeze(-1), all_masks
+
+    def forward(self, sequences_features, sequences_masks, sequences_timestamps=None):
+        tokens_list = [
+            self.mlps[i](sequences_features[i]) * sequences_masks[i].unsqueeze(-1)
+            for i in range(self.n_seq_types)
+        ]
+
+        if self.merge == "timestamp_aware":
+            return self._timestamp_aware_merge(tokens_list, sequences_masks, sequences_timestamps)
+        else:
+            return self._timestamp_agnostic_merge(tokens_list, sequences_masks)
 
 
 class NSGroupWiseTokenizer(nn.Module):
-    N_NS_TOKENS = 5
-
-    def __init__(self, d_model, embedding, piecewise_encoder, embedding_dim, num_hashes=1):
+    def __init__(self, d_model, in_dims):
         super().__init__()
-        self.piecewise_encoder = piecewise_encoder
-        self.embedding = embedding
-        emb_out = num_hashes * embedding_dim
-
-        self.mlp_dense = _mlp(piecewise_encoder.out_features, d_model)
-        self.mlp_uid = _mlp(embedding_dim, d_model)
-        self.mlp_item = _mlp(embedding_dim, d_model)
-        self.mlp_artist = _mlp(emb_out, d_model)
-        self.mlp_album = _mlp(emb_out, d_model)
+        self.mlps = nn.ModuleList([_mlp(dim, d_model) for dim in in_dims])
 
     @property
     def n_ns_tokens(self):
-        return self.N_NS_TOKENS
+        return len(self.mlps)
 
-    def forward(self, batch):
-        dense_enc = self.piecewise_encoder(batch["dense"])
-        uid_emb = self.embedding(batch["sparse"][:, 0])
-        item_emb = self.embedding(batch["sparse"][:, 1])
-
-        artist = batch["multivalent"]["artist_ids"]
-        album = batch["multivalent"]["album_ids"]
-        artist_emb = _embed_multivalent(self.embedding, artist["values"], artist["lengths"])
-        album_emb = _embed_multivalent(self.embedding, album["values"], album["lengths"])
-
-        return torch.stack([
-            self.mlp_dense(dense_enc),
-            self.mlp_uid(uid_emb),
-            self.mlp_item(item_emb),
-            self.mlp_artist(artist_emb),
-            self.mlp_album(album_emb),
-        ], dim=1)
+    def forward(self, groups):
+        return torch.stack([mlp(g) for mlp, g in zip(self.mlps, groups)], dim=1)
 
 
 class NSAutoSplitTokenizer(nn.Module):
-    def __init__(self, d_model, l_ns, embedding, piecewise_encoder, embedding_dim, num_hashes=1):
+    def __init__(self, d_model, l_ns, in_dims):
         super().__init__()
-        self.piecewise_encoder = piecewise_encoder
-        self.embedding = embedding
         self._l_ns = l_ns
         self._d_model = d_model
-
-        in_dim = (
-            piecewise_encoder.out_features
-            + embedding_dim * 2
-            + num_hashes * embedding_dim * 2
-        )
-        self.proj = _mlp(in_dim, d_model * l_ns)
+        self.proj = _mlp(sum(in_dims), d_model * l_ns)
 
     @property
     def n_ns_tokens(self):
         return self._l_ns
 
-    def forward(self, batch):
-        dense_enc = self.piecewise_encoder(batch["dense"])
-        uid_emb = self.embedding(batch["sparse"][:, 0])
-        item_emb = self.embedding(batch["sparse"][:, 1])
-
-        artist = batch["multivalent"]["artist_ids"]
-        album = batch["multivalent"]["album_ids"]
-        artist_emb = _embed_multivalent(self.embedding, artist["values"], artist["lengths"])
-        album_emb = _embed_multivalent(self.embedding, album["values"], album["lengths"])
-
-        ns_concat = torch.cat([dense_enc, uid_emb, item_emb, artist_emb, album_emb], dim=1)
+    def forward(self, groups):
+        ns_concat = torch.cat(groups, dim=1)
         projected = self.proj(ns_concat)
         return projected.reshape(projected.shape[0], self._l_ns, self._d_model)
 
@@ -132,12 +130,12 @@ class OneTransTokenizer(nn.Module):
 
     def forward(self, batch):
         s_tokens, s_mask = self.s_tokenizer(
-            batch["seq_items"],
-            batch["seq_signals"],
-            batch["seq_mask"],
+            batch["seq_features"],
+            batch["seq_masks"],
+            batch.get("seq_timestamps"),
         )
 
-        ns_tokens = self.ns_tokenizer(batch)
+        ns_tokens = self.ns_tokenizer(batch["ns_groups"])
         B, L_NS, _ = ns_tokens.shape
         ns_mask = torch.ones(B, L_NS, dtype=torch.bool, device=ns_tokens.device)
 
