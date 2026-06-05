@@ -1,5 +1,5 @@
 from typing import List, Dict
-
+import polars as pl
 import numpy as np
 
 
@@ -75,3 +75,45 @@ def evaluate(
         "ndcg": ndcg,
         "coverage": coverage,
     }
+
+
+
+def compute_pairwise_accuracy(
+    uids: np.array,
+    timestamps: np.array,
+    labels: np.array,
+    probs: np.array,
+    session_gap_seconds: int = 15 * 60,
+) -> dict[str, float]:
+    df = pl.DataFrame({
+        "uid" : uids,
+        "ts" : timestamps,
+        "y" : labels,
+        "s" : probs
+    })
+    df = df.sort(by=["uid", "ts"])
+    df = df.with_columns(
+        pl.col("y").shift(1).over(partition_by="uid", order_by="ts").alias("prev_y"),
+        pl.col("s").shift(1).over(partition_by="uid", order_by="ts").alias("prev_s"),
+        pl.col("ts").shift(1).over(partition_by="uid", order_by="ts").alias("prev_ts")
+    )
+    df = df.filter(
+        (pl.col("ts") - pl.col("prev_ts")) < session_gap_seconds
+    )
+    df = df.filter(
+        (pl.col("y") != pl.col("prev_y"))
+    )
+    df = df.with_columns(
+        ((pl.col("y") - pl.col("prev_y")) * (pl.col("s") - pl.col("prev_s"))).alias("m")
+    )
+    df = df.with_columns(
+        (
+            pl.col("m").gt(0).cast(int)
+            + pl.col("s").eq(pl.col("prev_s")).cast(int).mul(0.5)
+            # + pl.col("y").eq(pl.col("prev_y")).cast(int).mul(0.5)
+        ).alias("m_final")
+    )
+    if len(df) == 0:
+        return 0
+    acc = df.select(pl.col("m_final").mean()).item()
+    return acc
