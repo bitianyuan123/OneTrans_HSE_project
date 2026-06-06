@@ -43,8 +43,8 @@ def train_epoch(embedder, tokenizer, backbone, loader, optimizer, scaler, device
         all_uids.append(batch["NS"]["sparse_features"]["uid"].cpu())
         wandb.log({"train/loss_step": loss.item()})
 
-    all_labels = torch.cat(all_labels).numpy()
-    all_probs = torch.cat(all_probs).numpy()
+    all_labels = torch.cat(all_labels).float().numpy()
+    all_probs = torch.cat(all_probs).float().numpy()
     all_uids = torch.cat(all_uids).numpy()
     return {
         "train/loss": total_loss / len(loader),
@@ -72,8 +72,8 @@ def eval_epoch(embedder, tokenizer, backbone, loader, device):
         all_probs.append(logits.sigmoid().cpu())
         all_uids.append(batch["NS"]["sparse_features"]["uid"].cpu())
 
-    all_labels = torch.cat(all_labels).numpy()
-    all_probs = torch.cat(all_probs).numpy()
+    all_labels = torch.cat(all_labels).float().numpy()
+    all_probs = torch.cat(all_probs).float().numpy()
     all_uids = torch.cat(all_uids).numpy()
     return {
         "val/loss": total_loss / len(loader),
