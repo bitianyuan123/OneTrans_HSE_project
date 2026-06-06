@@ -42,6 +42,6 @@ class CoreOneTransBlock(nn.Module):
         z = self.mixed_attn(self.norm(x), mask=mask) + x
         x = z + self.mixed_ffn(self.norm(z))
         # x of shape (B, input_S + NS, D)
-        x = x[:, self.out_seq_num + self.ns_tokens_num:, :]
+        x = x[:, -(self.out_seq_num + self.ns_tokens_num):, :]
         # now of desired shape: (B, out_S + NS, D)
         return x
