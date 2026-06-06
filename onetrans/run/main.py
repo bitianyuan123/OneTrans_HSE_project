@@ -4,8 +4,6 @@ import wandb
 from torch.utils.data import DataLoader
 
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
-from onetrans.ext.yambda.dataset import BinaryRankinArchive, BinaryRankinSequentialDataset
-from onetrans.utils.collator import collate_fn
 from onetrans.run.builder import build_model
 from onetrans.run.train import train_epoch, eval_epoch
 from onetrans.run.config import DatasetConfig
@@ -39,20 +37,8 @@ def main():
 
     data_config = DatasetConfig(batch_size=args.batch_size, num_workers=args.num_workers, max_users=args.max_users)
     cookin = DataCookinYambdaRank()
-    listens, timestamp_test_start = cookin.cook(data_config)
-
-    archive = BinaryRankinArchive(listens)
-    train_set = BinaryRankinSequentialDataset(archive, max_seq_len=args.max_seq_len,
-                                              timestamp_test_start=timestamp_test_start)
-    test_set = BinaryRankinSequentialDataset(archive, is_train=False, max_seq_len=args.max_seq_len,
-                                             timestamp_test_start=timestamp_test_start)
-
-    train_loader = DataLoader(train_set, batch_size=data_config.batch_size,
-                              shuffle=True, num_workers=data_config.num_workers,
-                              collate_fn=collate_fn)
-    test_loader = DataLoader(test_set, batch_size=data_config.batch_size,
-                             shuffle=False, num_workers=data_config.num_workers,
-                             collate_fn=collate_fn)
+    train_loader, test_loader = cookin.run(data_config)
+    archive = train_loader.dataset.archive
 
     embedder, tokenizer, backbone = build_model(
         archive, args.d_model, args.n_layers, args.n_heads, args.max_seq_len, device
