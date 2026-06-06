@@ -1,0 +1,35 @@
+import polars as pl
+import torch.nn as nn
+
+from onetrans.ext.yambda.embedder import YambdaEmbedder
+from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
+from onetrans.nn.tokenizer import STokenizer, NSGroupWiseTokenizer, OneTransTokenizer
+from onetrans.nn.models.one_trans import OneTrans
+from onetrans.run.config import DENSE_COLUMNS
+
+
+def build_model(archive, d_model, n_layers, n_heads, max_seq_len, device):
+    embedder = YambdaEmbedder(
+        item_embedding=nn.Embedding(archive.meta["num_items"] + 1, d_model, padding_idx=0),
+        user_embedding=nn.Embedding(archive.meta["num_users"] + 1, d_model),
+        artist_embedding=nn.Embedding(archive.meta["num_artists"] + 1, d_model),
+        album_embedding=nn.Embedding(archive.meta["num_albums"] + 1, d_model),
+        piecewise_encoder=PiecewiseLinearEncoder.from_dataset(
+            pl.from_numpy(archive.dense_matrix, schema=list(DENSE_COLUMNS))
+        ),
+        max_seq_len=max_seq_len,
+    )
+
+    s_tok = STokenizer(d_model, in_dims=[embedder.seq_in_dim], merge="timestamp_agnostic")
+    ns_tok = NSGroupWiseTokenizer(d_model, in_dims=embedder.ns_group_dims)
+    tokenizer = OneTransTokenizer(s_tok, ns_tok, d_model)
+
+    backbone = OneTrans(
+        d_model=d_model,
+        num_blocks=n_layers,
+        num_heads=n_heads,
+        max_seq_len=max_seq_len,
+        ns_tokens_num=ns_tok.n_ns_tokens,
+    )
+
+    return embedder.to(device), tokenizer.to(device), backbone.to(device)

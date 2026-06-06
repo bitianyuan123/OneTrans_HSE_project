@@ -50,32 +50,26 @@ class MixedCausalSelfAttention(nn.Module):
         B, total_len, D = x.shape
         sequential_tokens_num = total_len - self.ns_tokens_num
 
-        # по статье все QKV в итоге идут в один multi head attn
-        Q = torch.zeros(B, total_len, self.n_heads, self.head_dim, device=x.device)
-        K = torch.zeros(B, total_len, self.n_heads, self.head_dim, device=x.device)
-        V = torch.zeros(B, total_len, self.n_heads, self.head_dim, device=x.device)
-
-        # sequential часть
-        s_tokens = x[:, :sequential_tokens_num, :] # (B, s_num, D)
-        s_qkv = self.W_s(s_tokens) # (B, s_num, 3 * d_model)
+        s_tokens = x[:, :sequential_tokens_num, :]
+        s_qkv = self.W_s(s_tokens)
         s_qkv = s_qkv.reshape(B, sequential_tokens_num, 3, self.n_heads, self.head_dim)
         s_Q, s_K, s_V = s_qkv.unbind(dim=2)
 
-        Q[:, :sequential_tokens_num] = s_Q
-        K[:, :sequential_tokens_num] = s_K
-        V[:, :sequential_tokens_num] = s_V
-
-        # non sequential часть
         ns_tokens = x[:, sequential_tokens_num:, :]
+
+        ns_Qs, ns_Ks, ns_Vs = [], [], []
         for i in range(self.ns_tokens_num):
-            ns_token = ns_tokens[:, i, :]  # (B, D)
-            ns_qkv = self.W_ns_list[i](ns_token)  # (B, 3 * D)
+            ns_token = ns_tokens[:, i, :]
+            ns_qkv = self.W_ns_list[i](ns_token)
             ns_qkv = ns_qkv.reshape(B, 3, self.n_heads, self.head_dim)
             ns_Q, ns_K, ns_V = ns_qkv.unbind(dim=1)
+            ns_Qs.append(ns_Q.unsqueeze(1))
+            ns_Ks.append(ns_K.unsqueeze(1))
+            ns_Vs.append(ns_V.unsqueeze(1))
 
-            Q[:, sequential_tokens_num + i] = ns_Q
-            K[:, sequential_tokens_num + i] = ns_K
-            V[:, sequential_tokens_num + i] = ns_V
+        Q = torch.cat([s_Q, *ns_Qs], dim=1)
+        K = torch.cat([s_K, *ns_Ks], dim=1)
+        V = torch.cat([s_V, *ns_Vs], dim=1)
 
         Q = Q.transpose(1, 2)
         K = K.transpose(1, 2)
@@ -86,7 +80,6 @@ class MixedCausalSelfAttention(nn.Module):
             Q, K, V,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True
         )
         assert scores.shape == (B, self.n_heads, total_len, self.head_dim)
 

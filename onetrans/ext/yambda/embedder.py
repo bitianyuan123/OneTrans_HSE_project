@@ -8,24 +8,32 @@ from onetrans.nn.tokenizer import embed_multivalent
 class YambdaEmbedder(nn.Module):
     def __init__(
         self,
-        embedding,
-        piecewise_encoder,
-        max_seq_len = 100,
-        num_hashes = 1,
+        item_embedding: nn.Embedding,
+        user_embedding: nn.Embedding,
+        artist_embedding: nn.Embedding,
+        album_embedding: nn.Embedding,
+        piecewise_encoder: PiecewiseLinearEncoder,
+        max_seq_len: int = 100,
     ):
         super().__init__()
-        self.embedding = embedding
+        self.item_embedding = item_embedding
+        self.user_embedding = user_embedding
+        self.artist_embedding = artist_embedding
+        self.album_embedding = album_embedding
         self.piecewise_encoder = piecewise_encoder
         self.max_seq_len = max_seq_len
-        self.num_hashes = num_hashes
+
+    @property
+    def embed_dim(self) -> int:
+        return self.item_embedding.embedding_dim
 
     @property
     def seq_in_dim(self) -> int:
-        return self.embedding.embedding_dim
+        return self.embed_dim
 
     @property
     def ns_group_dims(self) -> list[int]:
-        d = self.embedding.embedding_dim * self.num_hashes
+        d = self.embed_dim
         return [
             self.piecewise_encoder.out_features,  # dense
             d,  # uid
@@ -33,11 +41,6 @@ class YambdaEmbedder(nn.Module):
             d,  # artist_ids
             d,  # album_ids
         ]
-
-    def _embed_sparse(self, ids: torch.Tensor) -> torch.Tensor:
-        if ids.dim() == 1:
-            return self.embedding(ids)
-        return self.embedding(ids).reshape(ids.shape[0], -1)
 
     def forward(self, batch: dict) -> dict:
         flat_ids = batch["S"]["item_id"]
@@ -52,18 +55,17 @@ class YambdaEmbedder(nn.Module):
             torch.arange(L, device=padded_ids.device).unsqueeze(0)
             < lengths.unsqueeze(1).clamp(max=self.max_seq_len)
         )
-        seq_emb = self.embedding(padded_ids) * seq_mask.unsqueeze(-1)
+        seq_emb = self.item_embedding(padded_ids) * seq_mask.unsqueeze(-1)
 
         ns = batch["NS"]
-
-        uid_emb = self._embed_sparse(ns["sparse_features"]["uid"])
-        item_emb = self._embed_sparse(ns["sparse_features"]["item_id"])
+        uid_emb = self.user_embedding(ns["sparse_features"]["uid"])
+        item_emb = self.item_embedding(ns["sparse_features"]["item_id"])
         dense_enc = self.piecewise_encoder(ns["dense_features"])
 
         artist = ns["multivalent_features"]["artist_ids"]
         album = ns["multivalent_features"]["album_ids"]
-        artist_emb = embed_multivalent(self.embedding, artist["values"], artist["lengths"])
-        album_emb = embed_multivalent(self.embedding, album["values"], album["lengths"])
+        artist_emb = embed_multivalent(self.artist_embedding, artist["values"], artist["lengths"])
+        album_emb = embed_multivalent(self.album_embedding, album["values"], album["lengths"])
 
         return {
             "seq_features": [seq_emb],

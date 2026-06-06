@@ -1,6 +1,18 @@
 from typing import List, Dict
 import polars as pl
 import numpy as np
+from sklearn.metrics import roc_auc_score
+
+
+def uauc(labels: np.ndarray, probs: np.ndarray, uids: np.ndarray) -> float:
+    user_aucs = []
+    for uid in np.unique(uids):
+        mask = uids == uid
+        y, p = labels[mask], probs[mask]
+        if len(np.unique(y)) < 2:
+            continue
+        user_aucs.append(roc_auc_score(y, p))
+    return float(np.mean(user_aucs)) if user_aucs else 0.0
 
 
 def get_metrics(targets: List[int], candidates: List[int], topk: int) -> Dict[str, float]:
