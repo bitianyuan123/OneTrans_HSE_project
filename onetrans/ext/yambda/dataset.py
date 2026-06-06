@@ -6,6 +6,8 @@ from tqdm import tqdm
 from typing import Dict, List
 from onetrans.run.config import DENSE_COLUMNS
 import numpy as np
+from onetrans.nn.encoders.multihash import MultihashTransform
+
 
 class BinaryRankinArchive:
     def __init__(
@@ -14,7 +16,12 @@ class BinaryRankinArchive:
     ):
         # Sort once so every per-user structure shares the same row order.
         s = listens.sort(["uid", "timestamp"])
-
+        self.meta = {
+            "num_items": self.count_ids(listens, "item_id"),
+            "num_albums": self.count_ids(listens, "album_ids"),
+            "num_artists": self.count_ids(listens, "artist_ids"),
+            "num_users" : self.count_ids(listens, "uid")
+        }
         # Single group_by pass to build the full per-user history lists.
         agg = s.group_by("uid", maintain_order=True).agg(
             pl.col("item_id"),
@@ -72,19 +79,26 @@ class BinaryRankinArchive:
         self.interesting_pairs = list(zip(pair_uids, pair_ts, pair_timestamps))
 
 
+    def count_ids(self, listens, col):
+        if listens[col].dtype == pl.List:
+            return listens.select(col).explode(col).select(pl.col(col).max()).item()
+        else:
+            return listens.select(pl.col(col).max()).item()
+
 class BinaryRankinSequentialDataset(Dataset):
     def __init__(
       self,
       archive : BinaryRankinArchive,
       max_seq_len: int = 100,
       is_train : bool = True,
-      timestamp_test_start : int = 67
+      timestamp_test_start : int = 67,
     ) -> None:
         super().__init__()
         self.is_train = is_train
         self.max_seq_len = max_seq_len
         self.sequences = []
         self.archive = archive
+        self.timestamp_test_start = timestamp_test_start
 
         for uid, t, ts in archive.interesting_pairs:
             if self.is_train and ts < timestamp_test_start:
@@ -101,20 +115,27 @@ class BinaryRankinSequentialDataset(Dataset):
         start = max(0, t - self.max_seq_len)
         out = {
             "S": {
-                "history" : {
-                    "item_id" : self.archive.histories[uid][start:t],
-                    "album_id" : self.archive.album_ids[uid][start:t],
-                    "artist_id" : self.archive.artist_ids[uid][start:t],
-                    "length" : t - start
-                },
+                "item_id" : self.archive.histories[uid][start:t],
+                "album_ids" : self.archive.album_ids[uid][start:t],
+                "artist_ids" : self.archive.artist_ids[uid][start:t],
+                "length" : t - start
             },
             "NS" : {
-                "uid" : uid,
+                "sparse_features" : {
+                    "uid" : uid,
+                    "item_id" : self.archive.histories[uid][t]
+                },
                 "timestamp" : self.archive.timestamps[uid][t],
                 "dense_features" : self.archive.dense_matrix[self.archive.dense_index[(uid, t)]],
                 "multivalent_features" : {
-                    "artist_id" : self.archive.artist_ids[uid][t],
-                    "album_id" : self.archive.album_ids[uid][t],
+                    "artist_ids" : {
+                        "values" : self.archive.artist_ids[uid][t],
+                        "length" : len(self.archive.artist_ids[uid][t])
+                    },
+                    "album_ids" : {
+                        "values" : self.archive.album_ids[uid][t],
+                        "length" : len(self.archive.album_ids[uid][t])
+                    },
                 }
             },
             "targets" : {
