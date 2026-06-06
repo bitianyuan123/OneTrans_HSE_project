@@ -90,20 +90,34 @@ class DCNV2(nn.Module):
             dense_train_df,
             n_bins,
             train_df_slice,
-            cardinality=65536,
+            num_items,
+            num_users,
+            num_artists,
+            num_albums,
             num_experts: int = 4,
             low_rank: int = 32,
             output_size: int = 2,
     ):
         super().__init__()
 
-        self.embedding = nn.Embedding(
-            num_embeddings=cardinality,
+        self.user_encoder = CategoricalEncoder(nn.Embedding(
+            num_embeddings=num_users,
             embedding_dim=embedding_size
-        )
+        ))
+        self.item_encoder = CategoricalEncoder(nn.Embedding(
+            num_embeddings=num_items,
+            embedding_dim=embedding_size
+        ))
 
-        self.categorical_encoder = CategoricalEncoder(self.embedding)
-        self.multivalent_encoder = MultivalentEncoder(self.embedding)
+        self.artist_encoder = MultivalentEncoder(nn.Embedding(
+            num_embeddings=num_artists,
+            embedding_dim=embedding_size
+        ))
+
+        self.album_encoder = MultivalentEncoder(nn.Embedding(
+            num_embeddings=num_albums,
+            embedding_dim=embedding_size
+        ))
 
         self.piecewise_encoder = PiecewiseLinearEncoder.from_dataset(
             dense_train_df=dense_train_df,
@@ -128,14 +142,14 @@ class DCNV2(nn.Module):
         )
 
     def forward(self, inputs: dict) -> torch.Tensor:
-        uid_emb = self.categorical_encoder(inputs["sparse_features"]["uid"])
-        item_emb = self.categorical_encoder(inputs["sparse_features"]["item_id"])
+        uid_emb = self.user_encoder(inputs["sparse_features"]["uid"])
+        item_emb = self.item_encoder(inputs["sparse_features"]["item_id"])
 
-        artist_emb = self.multivalent_encoder(
+        artist_emb = self.artist_encoder(
             inputs["multivalent_features"]["artist_ids"]["values"],
             inputs["multivalent_features"]["artist_ids"]["lengths"]
         )
-        album_emb = self.multivalent_encoder(
+        album_emb = self.album_encoder(
             inputs["multivalent_features"]["album_ids"]["values"],
             inputs["multivalent_features"]["album_ids"]["lengths"]
         )
