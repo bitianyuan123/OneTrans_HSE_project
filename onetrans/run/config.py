@@ -23,6 +23,7 @@ class DatasetConfig:
     lag_seconds: int = 15 * 60
     batch_size : int = 8
     num_workers : int = 0
+    max_users: int = None  # subsample N users; None = use all
 
 
 DENSE_COLUMNS: tuple[str, ...] = (

@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--max_users", type=int, default=None)
     return parser.parse_args()
 
 
@@ -36,7 +37,7 @@ def main():
         config=vars(args),
     )
 
-    data_config = DatasetConfig(batch_size=args.batch_size, num_workers=args.num_workers)
+    data_config = DatasetConfig(batch_size=args.batch_size, num_workers=args.num_workers, max_users=args.max_users)
     cookin = DataCookinYambdaRank()
     listens, timestamp_test_start = cookin.cook(data_config)
 
@@ -59,7 +60,7 @@ def main():
 
     params = list(embedder.parameters()) + list(tokenizer.parameters()) + list(backbone.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     for epoch in range(args.n_epochs):
         train_metrics = train_epoch(embedder, tokenizer, backbone, train_loader, optimizer, scaler, device)

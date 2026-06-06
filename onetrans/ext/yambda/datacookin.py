@@ -77,6 +77,14 @@ class DataCookinYambdaRank:
         filtrator = CoreFiltrator(min_freq=CORE_MIN_INTERACTIONS_PER_ITEM)
         listens = filtrator(listens).collect(engine="streaming").lazy()
 
+        if dataset_config.max_users is not None:
+            sampled_users = (
+                listens.select("uid").unique().collect()
+                .sample(n=dataset_config.max_users, seed=42)
+                .lazy()
+            )
+            listens = listens.join(sampled_users, on="uid")
+
         yambda_dataset = YambdaDataset(
             dataset_type=dataset_config.dataset_type,
             dataset_size=dataset_config.dataset_size
