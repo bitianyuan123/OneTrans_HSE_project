@@ -21,8 +21,8 @@ def embed_multivalent(embedding, values, lengths):
     outputs = []
     for h in range(num_hashes):
         emb = embedding_bag(
-            embedding.weight,
             values[:, h].contiguous(),
+            embedding.weight,
             offsets=offsets,
             mode="mean",
             sparse=False,
