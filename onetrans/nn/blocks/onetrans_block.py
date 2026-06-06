@@ -39,7 +39,7 @@ class CoreOneTransBlock(nn.Module):
         returns:
             out : outputs of shape (batch_size, out_seq_num + NS, d_model)
         '''
-        z = self.mixed_attn(self.norm(x)) + x
+        z = self.mixed_attn(self.norm(x), mask=mask) + x
         x = z + self.mixed_ffn(self.norm(z))
         # x of shape (B, input_S + NS, D)
         x = x[:, :self.out_seq_num + self.ns_tokens_num, :]

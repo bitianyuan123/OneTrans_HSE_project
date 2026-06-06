@@ -16,6 +16,7 @@ class OneTrans(nn.Module):
         dropout : float = 0.0,
         dimensionality_reduction : str = "linear"
     ):
+        super().__init__()
         self.d_model = d_model
         self.num_blocks = num_blocks
         self.num_heads = num_heads
@@ -30,11 +31,11 @@ class OneTrans(nn.Module):
                 self.d_model,
                 self.num_heads,
                 self.ns_tokens_num,
-                self.dropout,
+                dropout,
                 self.dims[i + 1]
             ) for i in range(self.num_blocks)
         ])
-        self.linear = nn.Linear(self.d_model, 1)
+        self.linear = nn.Linear(self.d_model, 2)
 
     def forward(self, x, mask):
         '''
