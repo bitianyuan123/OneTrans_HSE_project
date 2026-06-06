@@ -41,9 +41,9 @@ def main():
     listens, timestamp_test_start = cookin.cook(data_config)
 
     archive = BinaryRankinArchive(listens)
-    train_set = BinaryRankinSequentialDataset(archive, max_seq_len=max_seq_len,
+    train_set = BinaryRankinSequentialDataset(archive, max_seq_len=args.max_seq_len,
                                               timestamp_test_start=timestamp_test_start)
-    test_set = BinaryRankinSequentialDataset(archive, is_train=False, max_seq_len=max_seq_len,
+    test_set = BinaryRankinSequentialDataset(archive, is_train=False, max_seq_len=args.max_seq_len,
                                              timestamp_test_start=timestamp_test_start)
 
     train_loader = DataLoader(train_set, batch_size=data_config.batch_size,
