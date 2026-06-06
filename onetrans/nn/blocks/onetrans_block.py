@@ -17,6 +17,8 @@ class CoreOneTransBlock(nn.Module):
     ):
         super().__init__()
         self.norm = nn.RMSNorm(normalized_shape=(d_model, ))
+        self.out_seq_num = out_seq_num
+        self.ns_tokens_num = ns_tokens_num
         self.mixed_attn = MixedCausalSelfAttention(
             d_model=d_model,
             n_heads=n_heads,
@@ -29,11 +31,17 @@ class CoreOneTransBlock(nn.Module):
             dropout=dropout
         )
 
-    def forward(self, x):
+    def forward(self, x, mask):
         '''
         args:
             x : inputs of shape (batch_size, S + NS, d_model)
+            mask : boolean mask of shape (batch_size, max_seq_len)
         returns:
             out : outputs of shape (batch_size, out_seq_num + NS, d_model)
         '''
-        pass
+        z = self.mixed_attn(self.norm(x)) + x
+        x = z + self.mixed_ffn(self.norm(z))
+        # x of shape (B, input_S + NS, D)
+        x = x[:, :self.out_seq_num + self.ns_tokens_num, :]
+        # now of desired shape: (B, out_S + NS, D)
+        return x
