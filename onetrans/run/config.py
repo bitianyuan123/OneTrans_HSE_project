@@ -43,6 +43,8 @@ DENSE_COLUMNS: tuple[str, ...] = (
 MULTIVALENT_COLUMNS: tuple[str, ...] = ("artist_ids", "album_ids")
 SPARSE_COLUMNS = ("uid", "item_id")
 LABEL_COLUMNS = ("is_like", "is_full_play")
+CORE_MIN_INTERACTIONS_PER_ITEM = 5
+TEST_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 
 dataset_config = DatasetConfig()
 one_trans_config = OneTransConfig()

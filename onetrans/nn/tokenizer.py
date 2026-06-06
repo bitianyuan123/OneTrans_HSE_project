@@ -129,6 +129,15 @@ class OneTransTokenizer(nn.Module):
         return self.ns_tokenizer.n_ns_tokens
 
     def forward(self, batch):
+        '''
+        B, L, D = batch_size, sequence length, d_model
+        args:
+            batch: dict with following keys
+                seq_features: List[torch.Tensor(dtype=float32)], each tensor of shape (B, L, D)
+                seq_masks: List[torch.Tensor(dtype=bool)], each tensor of shape (B, L)
+                seq_timestamps: List[torch.Tensor(dtype=long)], each tensor of shape (B, L)
+                ns_groups: ???
+        '''
         s_tokens, s_mask = self.s_tokenizer(
             batch["seq_features"],
             batch["seq_masks"],

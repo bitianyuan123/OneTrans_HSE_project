@@ -2,9 +2,12 @@ import polars as pl
 from torch.utils.data import DataLoader
 from huggingface_hub import hf_hub_download
 from typing import Literal
-from onetrans.run.config import DENSE_COLUMNS, SPARSE_COLUMNS, MULTIVALENT_COLUMNS, LABEL_COLUMNS
-from onetrans.data.transforms import PreferencePairsExtractor, FeatureJoiner, TemporalTranTestSplitter
-from onetrans.ext.yambda.dataset import RankerDataset
+from onetrans.run.config import DENSE_COLUMNS, SPARSE_COLUMNS, MULTIVALENT_COLUMNS, LABEL_COLUMNS, TEST_INTERVAL_SECONDS
+from onetrans.data.transforms import (
+    FeatureJoiner, 
+    IidMapper
+)
+from onetrans.ext.yambda.dataset import BinaryRankinSequentialDataset, BinaryRankinArchive
 from onetrans.nn.encoders.multihash import MultihashTransform
 from typing import Tuple
 from datasets import Dataset, DatasetDict, load_dataset
@@ -65,8 +68,10 @@ class DataCookinYambdaRank:
         )
         listens = pl.read_parquet(path)
 
-        extractor = PreferencePairsExtractor()
-        listens = extractor(listens)
+        iid_mapper = IidMapper()
+        listens = iid_mapper(listens)
+        
+        timestamp_test_start = listens.select(pl.col("timestamp")).max().item() - TEST_INTERVAL_SECONDS
     
         yambda_dataset = YambdaDataset(
             dataset_type=dataset_config.dataset_type,
@@ -77,65 +82,17 @@ class DataCookinYambdaRank:
 
         joiner = FeatureJoiner()
         listens = joiner(listens, artists, albums)
-
-        time_splitter = TemporalTranTestSplitter()
-        train_listens, test_listens = time_splitter(listens, test_last_seconds=30 * 24 * 60 * 60)
-        return train_listens, test_listens
+        # listens = listens.sample(n=100000)
+        return listens, timestamp_test_start
 
     def run(self, dataset_config):
         '''
-            Full pipeline from raw data to train & test loaders
-            --> for Transformer-like models (OneTrans, RankMixer): masked sequences of fixed length
-            --> otherwise: flattened sequences of variable length ???
+            MLil znatno nash MLin
         '''
-        train_listens, test_listens = self.cook(dataset_config)
-        multihash_transform = MultihashTransform(
-            sparse_features_config={
-                'item_id': [1, 2, 3, 4, 5],
-                'uid': [6, 7, 8, 9, 10],
-            },
-            sparse_features_name="sparse_features",
-            multivalent_features_config={
-                'artist_ids': [11, 12, 13, 14, 15],
-                'album_ids': [16, 17, 18, 19, 20],
-            },
-            multivalent_features_name="multivalent_features",
-            cardinality=65379,
+        listens, timestamp_test_start = self.cook(dataset_config)
+        archive = BinaryRankinArchive(listens)
+        train_set, test_set = (
+            BinaryRankinSequentialDataset(archive, timestamp_test_start=timestamp_test_start),
+            BinaryRankinSequentialDataset(archive, is_train=False, timestamp_test_start=timestamp_test_start)
         )
-
-        train_dataset = RankerDataset(
-            train_listens,
-            [multihash_transform],
-            label_columns=list(LABEL_COLUMNS),
-            dense_columns=list(DENSE_COLUMNS),
-            sparse_columns=list(SPARSE_COLUMNS),
-            multivalent_columns=list(MULTIVALENT_COLUMNS),
-            batch_size=10000,
-        )
-
-        test_dataset = RankerDataset(
-            test_listens,
-            [multihash_transform],
-            label_columns=list(LABEL_COLUMNS),
-            dense_columns=list(DENSE_COLUMNS),
-            sparse_columns=list(SPARSE_COLUMNS),
-            multivalent_columns=list(MULTIVALENT_COLUMNS),
-            batch_size=1024,
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            collate_fn=lambda batch: batch[0],
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=lambda batch: batch[0],
-        )
-
-        return train_loader, test_loader
+        return train_set, test_set

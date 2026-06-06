@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import polars as pl
+from typing import Tuple
+from onetrans.ext.yambda.dataset import BinaryRankinSequentialDataset
 
 class Transform:
     def __call__(self, x):
@@ -62,32 +64,6 @@ class ToDevice(Transform):
             return obj
         return _to_device_recursive(obj)
 
-class PreferencePairsExtractor(Transform):
-    def extract_preference_pairs(self, df: pl.DataFrame) -> pl.DataFrame:
-        return (
-            df
-            .with_row_index(name="row_id")
-            .sort(by=["uid", "timestamp", "row_id"])
-            .with_columns(
-                pl.col("is_like").shift(1).over(partition_by="uid", order_by="timestamp").alias("prev_like"),
-                pl.col("is_like").shift(-1).over(partition_by="uid", order_by="timestamp").alias("next_like"),
-                pl.col("is_full_play").shift(1).over(partition_by="uid", order_by="timestamp").alias("prev_fullplay"),
-                pl.col("is_full_play").shift(-1).over(partition_by="uid", order_by="timestamp").alias("next_fullplay")
-            )
-            .with_columns(
-                pl.any_horizontal(
-                    pl.col("prev_like") != pl.col("is_like"), 
-                    pl.col("next_like") != pl.col("is_like"), 
-                    pl.col("prev_fullplay") != pl.col("is_full_play"), 
-                    pl.col("next_fullplay") != pl.col("is_full_play")
-                ).alias("relevant")
-            )
-            .filter(pl.col("relevant"))
-            .drop(["row_id", "relevant", "prev_like", "next_like", "prev_fullplay", "next_fullplay"])
-    )
-
-    def __call__(self, df : pl.DataFrame) -> pl.DataFrame:
-        return self.extract_preference_pairs(df)
 
 
 class FeatureJoiner(Transform):
@@ -126,23 +102,17 @@ class FeatureJoiner(Transform):
         return self.join_item_artist_album(listens, artists, albums)
 
 
-class TemporalTranTestSplitter(Transform):
-    def temporal_train_test_split(
-        self,
-        df: pl.DataFrame,
-        test_last_seconds: float,
-        time_column: str = "timestamp",
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        SPLIT_TS = df.select(pl.col("timestamp").max()).item() - test_last_seconds + 1
-        return (
-            df.filter(pl.col("timestamp") < SPLIT_TS),
-            df.filter(pl.col("timestamp") >= SPLIT_TS)
+class IidMapper(Transform):
+    def __call__(self, listens):
+        iid_mapping = (
+            listens
+            .select(pl.col("item_id").unique().sort())
+            .with_row_index(name="new_item_id")
         )
-
-    def __call__(
-        self, 
-        df, 
-        test_last_seconds : float, 
-        time_column : str = "timestamp"
-    ):
-        return self.temporal_train_test_split(df, test_last_seconds, time_column)
+        listens = (
+            listens
+            .join(iid_mapping, on="item_id", how="inner")
+            .drop("item_id")
+            .rename({"new_item_id" : "item_id"})
+        )
+        return listens
