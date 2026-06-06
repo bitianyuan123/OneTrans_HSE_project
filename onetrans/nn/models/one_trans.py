@@ -46,7 +46,7 @@ class OneTrans(nn.Module):
                 out : logits of shape (batch_size, )
         '''
         for block in self.blocks:
-            x = block(x, mask)
+            x, mask = block(x, mask)
         x = x.mean(dim=1)
         x = self.linear(x)
         return x

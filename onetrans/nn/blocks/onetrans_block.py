@@ -35,13 +35,20 @@ class CoreOneTransBlock(nn.Module):
         '''
         args:
             x : inputs of shape (batch_size, S + NS, d_model)
-            mask : boolean mask of shape (batch_size, max_seq_len)
+            mask : boolean mask of shape (batch_size, S + NS)
         returns:
             out : outputs of shape (batch_size, out_seq_num + NS, d_model)
+            mask : updated mask of shape (batch_size, out_seq_num + NS)
         '''
         z = self.mixed_attn(self.norm(x), mask=mask) + x
-        x = z + self.mixed_ffn(self.norm(z))
-        # x of shape (B, input_S + NS, D)
-        x = x[:, -(self.out_seq_num + self.ns_tokens_num):, :]
-        # now of desired shape: (B, out_S + NS, D)
-        return x
+        z = z + self.mixed_ffn(self.norm(z))
+
+        s_tokens = z[:, :self.out_seq_num, :]
+        ns_tokens = z[:, -self.ns_tokens_num:, :]
+        z = torch.cat([s_tokens, ns_tokens], dim=1)
+
+        s_mask = mask[:, :self.out_seq_num]
+        ns_mask = mask[:, -self.ns_tokens_num:]
+        mask = torch.cat([s_mask, ns_mask], dim=1)
+
+        return z, mask
