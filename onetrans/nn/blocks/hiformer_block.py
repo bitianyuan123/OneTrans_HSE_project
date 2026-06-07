@@ -61,37 +61,37 @@ class HiformerLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
 
-        # 1. Composite keys для каждой головы
+        # 1. Composite keys и values (без изменений)
         x_flat = x.view(B, L * D)  # [B, L*D]
 
         K_composite = []
         V_composite = []
 
         for h in range(self.n_heads):
-            # Key composite: [B, L*D] -> [B, rank_k] -> [B, L*d_k]
             k_mid = torch.matmul(x_flat, self.k_low[h])  # [B, rank_k]
             k_comp = torch.matmul(k_mid, self.k_high[h])  # [B, L*d_k]
             K_composite.append(k_comp)
 
-            # Value composite
-            v_mid = torch.matmul(x_flat, self.v_low[h])
-            v_comp = torch.matmul(v_mid, self.v_high[h])
+            v_mid = torch.matmul(x_flat, self.v_low[h])  # [B, rank_v]
+            v_comp = torch.matmul(v_mid, self.v_high[h])  # [B, L*d_v]
             V_composite.append(v_comp)
 
-        # Stack по головам: [n_heads, B, L*d_k] -> [B, n_heads, L, d_k]
         K_composite = torch.stack(K_composite, dim=1).view(B, self.n_heads, L, self.d_k)
         V_composite = torch.stack(V_composite, dim=1).view(B, self.n_heads, L, self.d_v)
 
-        # 2. Запросы для каждой головы и каждого признака
-        # x: [B, L, D] -> q: [B, n_heads, L, d_k]
-        q = torch.einsum('bld,fhld->bhlf', x, self.q_projs)  # [B, n_heads, L, d_k]
+        # 2. Запросы – исправленный блок
+        # x: [B, L, D]
+        # self.q_projs: [L, n_heads, D, d_k]
+        x_reshaped = x.unsqueeze(2)  # [B, L, 1, D]
+        q = torch.matmul(x_reshaped, self.q_projs)  # [B, L, n_heads, d_k]
+        q = q.permute(0, 2, 1, 3)  # [B, n_heads, L, d_k]
 
-        # 3. Attention scores
+        # 3. Attention
         attn_logits = torch.matmul(q, K_composite.transpose(-2, -1)) / math.sqrt(self.d_k)
         attn = torch.softmax(attn_logits, dim=-1)
         attn = self.dropout(attn)
 
-        # 4. Apply attention to composite values
+        # 4. Apply attention
         out = torch.matmul(attn, V_composite)  # [B, n_heads, L, d_v]
         out = out.transpose(1, 2).contiguous().view(B, L, -1)  # [B, L, D]
         out = self.out_proj(out)
