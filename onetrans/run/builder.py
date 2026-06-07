@@ -22,7 +22,7 @@ def build_model(archive, d_model, n_layers, n_heads, max_seq_len, device):
 
     s_tok = STokenizer(d_model, in_dims=[embedder.seq_in_dim], merge="timestamp_agnostic")
     ns_tok = NSGroupWiseTokenizer(d_model, in_dims=embedder.ns_group_dims)
-    tokenizer = OneTransTokenizer(s_tok, ns_tok, d_model)
+    tokenizer = OneTransTokenizer(s_tok, ns_tok, d_model, max_seq_len)
 
     backbone = OneTrans(
         d_model=d_model,
