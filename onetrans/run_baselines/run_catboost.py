@@ -4,12 +4,25 @@ import numpy as np
 import wandb
 import polars as pl
 from sklearn.metrics import roc_auc_score
-from torch import nn
 
 from onetrans.baselines.catboost_model import CatBoostModel
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, SPARSE_COLUMNS, DENSE_COLUMNS
 from onetrans.utils.metrics import uauc
+
+
+def build_catboost_df(sequences, archive):
+    indices = [archive.dense_index[(uid, t)] for uid, t in sequences]
+    dense = archive.dense_matrix[indices]
+
+    df = pl.from_numpy(dense, schema=list(DENSE_COLUMNS))
+    df = df.with_columns([
+        pl.Series("uid", [uid for uid, _ in sequences], dtype=pl.Int64),
+        pl.Series("item_id", [archive.histories[uid][t] for uid, t in sequences], dtype=pl.Int64),
+        pl.Series("is_like", [archive.target_likes[uid][t] for uid, t in sequences]),
+        pl.Series("is_full_play", [archive.target_full_plays[uid][t] for uid, t in sequences]),
+    ])
+    return df
 
 
 def parse_args():
@@ -36,40 +49,53 @@ def main():
     print("[1/5] Loading data...")
     data_config = DatasetConfig(batch_size=256, num_workers=args.num_workers, max_users=args.max_users)
     cookin = DataCookinYambdaRank()
-    listens, timestamp_test_start = cookin.cook(data_config)
-    train_listens = listens.filter(pl.col('timestamp') < timestamp_test_start)
-    test_listens = listens.filter(pl.col('timestamp') >= timestamp_test_start)
-    print(f"[2/5] Data loaded.")
+    train_loader, test_loader = cookin.run(data_config)
+    archive = train_loader.dataset.archive
+    print(f"[2/5] Data loaded. Train pairs: {len(train_loader.dataset)}, test pairs: {len(test_loader.dataset)}")
 
-    print("[3/5] Building model...")
+    print("[3/5] Building features...")
+    train_df = build_catboost_df(train_loader.dataset.sequences, archive)
+    test_df = build_catboost_df(test_loader.dataset.sequences, archive)
 
-    X_train = train_listens.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
-    y_train = train_listens["is_like"].to_numpy().astype(int)
+    X_train = train_df.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
+    y_like_train = train_df["is_like"].to_numpy().astype(int)
 
-    X_test = test_listens.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
+    X_test = test_df.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
+    all_uids = test_df["uid"].to_numpy()
 
-    model = CatBoostModel(
-        cat_features=SPARSE_COLUMNS,
+    print("[4/5] Training is_like model...")
+    like_model = CatBoostModel(
+        cat_features=list(SPARSE_COLUMNS),
         iterations=args.iterations,
         learning_rate=args.lr,
         verbose=args.verbose,
     )
-    print(f"[4/5] Model built...")
+    like_probs = like_model.fit_predict(X_train=X_train, X_test=X_test, y_train=y_like_train)
 
-    print("[5/5] Starting training...")
+    print("[4/5] Training is_full_play model...")
+    y_fp_train = train_df["is_full_play"].to_numpy().astype(int)
+    fp_model = CatBoostModel(
+        cat_features=list(SPARSE_COLUMNS),
+        iterations=args.iterations,
+        learning_rate=args.lr,
+        verbose=args.verbose,
+    )
+    fp_probs = fp_model.fit_predict(X_train=X_train, X_test=X_test, y_train=y_fp_train)
 
-    probs = model.fit_predict(X_train=X_train, X_test=X_test, y_train=y_train)
-
-    all_uids = test_listens["uid"].to_numpy()
-
+    print("[5/5] Computing metrics...")
     val_metrics = {
-        "val/auc_like": roc_auc_score(test_listens["is_like"].to_numpy().astype(np.int32), probs),
-        "val/auc_full_play": roc_auc_score(test_listens["is_full_play"].to_numpy().astype(np.int32), probs),
-        "val/uauc_like": uauc(test_listens["is_like"].to_numpy().astype(np.int32), probs, all_uids),
-        "val/uauc_full_play": uauc(test_listens["is_full_play"].to_numpy().astype(np.int32), probs, all_uids),
+        "val/auc_like": roc_auc_score(test_df["is_like"].to_numpy().astype(np.int32), like_probs),
+        "val/auc_full_play": roc_auc_score(test_df["is_full_play"].to_numpy().astype(np.int32), fp_probs),
+        "val/uauc_like": uauc(test_df["is_like"].to_numpy().astype(np.int32), like_probs, all_uids),
+        "val/uauc_full_play": uauc(test_df["is_full_play"].to_numpy().astype(np.int32), fp_probs, all_uids),
     }
-    metrics = {**val_metrics, "epoch": 1}
-    wandb.log(metrics)
+    wandb.log({**val_metrics, "epoch": 1})
+    print(
+        f"val AUC like {val_metrics['val/auc_like']:.4f} | "
+        f"val AUC fp {val_metrics['val/auc_full_play']:.4f} | "
+        f"val uAUC like {val_metrics['val/uauc_like']:.4f} | "
+        f"val uAUC fp {val_metrics['val/uauc_full_play']:.4f}"
+    )
 
     wandb.finish()
 
