@@ -124,20 +124,20 @@ def main():
 
     print("[3/5] Building model...")
     model = DCNV2(
-        embedding_size=args.n_layers,
-        cross_layers=args.n_layers,
+        embedding_size=args.embedding_size,
+        cross_layers=args.cross_layers,
         deep_units=[256, 128, 64],
-        input_size=args.n_layers,
+        input_size=args.input_size,
         dense_train_df=pl.from_numpy(archive.dense_matrix, schema=list(DENSE_COLUMNS)),
-        n_bins=args.n_layers,
+        n_bins=args.n_bins,
         output_size=2,
         train_df_slice=1_000_000,
         num_albums=meta['num_albums'] + 1,
         num_artists=meta['num_artists'] + 1,
         num_users=meta['num_users'] + 1,
         num_items=meta['num_items'] + 1,
-        low_rank=args.n_layers,
-        num_experts=args.n_layers
+        low_rank=args.low_rank,
+        num_experts=args.num_experts
     )
     print(f"[4/5] Model built. Params: {sum(p.numel() for p in model.parameters())}")
 
