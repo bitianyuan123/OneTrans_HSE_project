@@ -118,11 +118,12 @@ class NSAutoSplitTokenizer(nn.Module):
 
 
 class OneTransTokenizer(nn.Module):
-    def __init__(self, s_tokenizer, ns_tokenizer, d_model):
+    def __init__(self, s_tokenizer, ns_tokenizer, d_model, max_seq_len):
         super().__init__()
         self.s_tokenizer = s_tokenizer
         self.ns_tokenizer = ns_tokenizer
         self.rms_norm = nn.RMSNorm(d_model)
+        self.pos_embedding = nn.Embedding(max_seq_len, d_model)
 
     @property
     def n_ns_tokens(self):
@@ -143,6 +144,9 @@ class OneTransTokenizer(nn.Module):
             batch["seq_masks"],
             batch.get("seq_timestamps"),
         )
+        B, L, _ = s_tokens.shape
+        positions = torch.arange(L, device=s_tokens.device).unsqueeze(0)
+        s_tokens = s_tokens + self.pos_embedding(positions)
 
         ns_tokens = self.ns_tokenizer(batch["ns_groups"])
         B, L_NS, _ = ns_tokens.shape
