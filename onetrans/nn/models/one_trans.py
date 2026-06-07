@@ -47,6 +47,6 @@ class OneTrans(nn.Module):
         '''
         for block in self.blocks:
             x, mask = block(x, mask)
-        x = x[:, -1, :]
+        x = x[:, -self.ns_tokens_num:, :].mean(dim=1)
         x = self.linear(x)
         return x
