@@ -12,8 +12,7 @@ from onetrans.nn.encoders.multihash import MultihashTransform
 class BinaryRankinArchive:
     def __init__(
         self,
-        listens,
-        session_gap_seconds: int = 15 * 60
+        listens
     ):
         # Sort once so every per-user structure shares the same row order.
         s = listens.sort(["uid", "timestamp"])
@@ -55,13 +54,10 @@ class BinaryRankinArchive:
                 nxt(col).is_not_null() & (pl.col(col) != nxt(col))
             )
 
-        session_gap = (pl.col("timestamp") - prev("timestamp")) <= session_gap_seconds
-
         interesting = (
             s.with_columns(pl.int_range(pl.len()).over("uid").alias("__t"))
             .filter(
                 (pl.col("__t") >= 1)
-                & session_gap
                 & (complicated("is_like") | complicated("is_full_play"))
             )
         )

@@ -107,7 +107,7 @@ class DataCookinYambdaRank:
             MLil znatno nash MLin
         '''
         listens, timestamp_test_start = self.cook(data_config)
-        archive = BinaryRankinArchive(listens, session_gap_seconds=data_config.session_gap_seconds)
+        archive = BinaryRankinArchive(listens)
         train_set, test_set = (
             BinaryRankinSequentialDataset(archive, timestamp_test_start=timestamp_test_start),
             BinaryRankinSequentialDataset(archive, is_train=False, timestamp_test_start=timestamp_test_start)
