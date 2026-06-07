@@ -70,20 +70,14 @@ class Hiformer(nn.Module):
 
         self.layers = nn.ModuleList()
         for i in range(num_layers):
-            is_last = (i == num_layers - 1)
-            if not is_last or not use_pruning_last:
-                self.layers.append(HiformerLayer(
-                    num_features=self.num_features,
-                    d_model=d_model,
-                    n_heads=n_heads,
-                    rank_k=rank_k,
-                    rank_v=rank_v,
-                    dropout=dropout
-                ))
-            else:
-                # Последний слой с pruning: используем только task token как query
-                self.layers.append(self._make_pruned_layer(d_model, n_heads, rank_k, rank_v, dropout))
-
+            self.layers.append(HiformerLayer(
+                num_features=self.num_features,
+                d_model=d_model,
+                n_heads=n_heads,
+                rank_k=rank_k,
+                rank_v=rank_v,
+                dropout=dropout
+            ))
         # ---------- Выходная голова ----------
         self.output_layer = nn.Sequential(
             nn.LayerNorm(d_model),
