@@ -61,37 +61,50 @@ class HiformerLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
 
-        # 1. Composite keys и values (без изменений)
+        # 1. Composite keys для каждой головы
         x_flat = x.view(B, L * D)  # [B, L*D]
 
         K_composite = []
         V_composite = []
 
         for h in range(self.n_heads):
+            # Key composite: [B, L*D] -> [B, rank_k] -> [B, L*d_k]
             k_mid = torch.matmul(x_flat, self.k_low[h])  # [B, rank_k]
             k_comp = torch.matmul(k_mid, self.k_high[h])  # [B, L*d_k]
             K_composite.append(k_comp)
 
+            # Value composite
             v_mid = torch.matmul(x_flat, self.v_low[h])  # [B, rank_v]
             v_comp = torch.matmul(v_mid, self.v_high[h])  # [B, L*d_v]
             V_composite.append(v_comp)
 
+        # Stack по головам: [B, n_heads, L, d_k] и [B, n_heads, L, d_v]
         K_composite = torch.stack(K_composite, dim=1).view(B, self.n_heads, L, self.d_k)
         V_composite = torch.stack(V_composite, dim=1).view(B, self.n_heads, L, self.d_v)
 
-        # 2. Запросы – исправленный блок
-        # x: [B, L, D]
-        # self.q_projs: [L, n_heads, D, d_k]
-        x_reshaped = x.unsqueeze(2)  # [B, L, 1, D]
-        q = torch.matmul(x_reshaped, self.q_projs)  # [B, L, n_heads, d_k]
-        q = q.permute(0, 2, 1, 3)  # [B, n_heads, L, d_k]
+        # 2. Запросы для каждой головы и каждого признака (простой цикл)
+        # q: [B, n_heads, L, d_k]
+        q_list = []
+        for h in range(self.n_heads):
+            q_h_list = []
+            for i in range(L):
+                # x[:, i, :]: [B, D]
+                # self.q_projs[i, h]: [D, d_k]
+                q_i = torch.matmul(x[:, i, :], self.q_projs[i, h])  # [B, d_k]
+                q_h_list.append(q_i)
+            # q_h: [B, L, d_k]
+            q_h = torch.stack(q_h_list, dim=1)
+            q_list.append(q_h)
 
-        # 3. Attention
+        # q: [B, n_heads, L, d_k]
+        q = torch.stack(q_list, dim=1)
+
+        # 3. Attention scores
         attn_logits = torch.matmul(q, K_composite.transpose(-2, -1)) / math.sqrt(self.d_k)
         attn = torch.softmax(attn_logits, dim=-1)
         attn = self.dropout(attn)
 
-        # 4. Apply attention
+        # 4. Apply attention to composite values
         out = torch.matmul(attn, V_composite)  # [B, n_heads, L, d_v]
         out = out.transpose(1, 2).contiguous().view(B, L, -1)  # [B, L, D]
         out = self.out_proj(out)
