@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn.functional import softmax
+import polars as pl
 
 from onetrans.nn.encoders.categorial import CategoricalEncoder
 from onetrans.nn.encoders.multivalent import MultivalentEncoder
@@ -83,17 +84,17 @@ class DeepNetwork(nn.Module):
 class DCNV2(nn.Module):
     def __init__(
             self,
-            embedding_size,
-            cross_layers,
-            deep_units,
-            input_size,
-            dense_train_df,
-            n_bins,
-            train_df_slice,
-            num_items,
-            num_users,
-            num_artists,
-            num_albums,
+            embedding_size: int,
+            cross_layers: int,
+            deep_units: list[int],
+            input_size: int,
+            dense_train_df: pl.DataFrame,
+            n_bins: int,
+            train_df_slice: int,
+            num_items: int,
+            num_users: int,
+            num_artists: int,
+            num_albums: int,
             num_experts: int = 4,
             low_rank: int = 32,
             output_size: int = 2,
