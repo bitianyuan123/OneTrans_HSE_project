@@ -44,7 +44,7 @@ def main():
     print("[3/5] Building model...")
 
     X_train = train_listens.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
-    y_train = train_listens["is_full_play"].to_numpy().astype(int)
+    y_train = train_listens["is_like"].to_numpy().astype(int)
 
     X_test = test_listens.select(list(DENSE_COLUMNS) + list(SPARSE_COLUMNS))
 
