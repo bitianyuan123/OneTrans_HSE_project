@@ -33,7 +33,7 @@ def main():
     )
 
     print("[1/5] Loading data...")
-    data_config = DatasetConfig(batch_size=args.batch_size, num_workers=args.num_workers, max_users=args.max_users)
+    data_config = DatasetConfig(batch_size=256, num_workers=args.num_workers, max_users=args.max_users)
     cookin = DataCookinYambdaRank()
     listens, timestamp_test_start = cookin.cook(data_config)
     train_listens = listens.filter(pl.col('timestamp') < timestamp_test_start)
