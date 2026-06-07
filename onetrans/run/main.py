@@ -30,7 +30,7 @@ def main():
 
     wandb.init(
         project="OneTrans",
-        entity="clifforders",
+        entity="recsysers",
         name=args.run_name,
         config=vars(args),
     )
