@@ -2,16 +2,13 @@ import torch
 from torch import nn
 
 from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
-from onetrans.nn.tokenizer import embed_multivalent
-
-
 class YambdaEmbedder(nn.Module):
     def __init__(
         self,
-        item_embedding: nn.Embedding,
+        item_embedding: nn.Module,
         user_embedding: nn.Embedding,
-        artist_embedding: nn.Embedding,
-        album_embedding: nn.Embedding,
+        artist_embedding: nn.Module,
+        album_embedding: nn.Module,
         piecewise_encoder: PiecewiseLinearEncoder,
         max_seq_len: int = 100,
     ):
@@ -25,7 +22,9 @@ class YambdaEmbedder(nn.Module):
 
     @property
     def embed_dim(self) -> int:
-        return self.item_embedding.embedding_dim
+        emb = self.item_embedding
+        # nn.Embedding has .embedding_dim; MultihashEmbedding wraps one internally
+        return emb.embedding_dim if hasattr(emb, "embedding_dim") else emb.embedding.embedding_dim
 
     @property
     def seq_in_dim(self) -> int:
@@ -44,11 +43,16 @@ class YambdaEmbedder(nn.Module):
 
     def forward(self, batch: dict) -> dict:
         flat_ids = batch["S"]["item_id"]
+        flat_ts = batch["S"]["timestamps"]
         lengths = batch["S"]["lengths"]
 
         sequences = flat_ids.split(lengths.tolist())
         padded_ids = nn.utils.rnn.pad_sequence(sequences, batch_first=True)
         padded_ids = padded_ids[:, : self.max_seq_len]
+
+        ts_sequences = flat_ts.split(lengths.tolist())
+        padded_ts = nn.utils.rnn.pad_sequence(ts_sequences, batch_first=True)
+        padded_ts = padded_ts[:, : self.max_seq_len]
 
         L = padded_ids.shape[1]
         seq_mask = (
@@ -64,11 +68,12 @@ class YambdaEmbedder(nn.Module):
 
         artist = ns["multivalent_features"]["artist_ids"]
         album = ns["multivalent_features"]["album_ids"]
-        artist_emb = embed_multivalent(self.artist_embedding, artist["values"], artist["lengths"])
-        album_emb = embed_multivalent(self.album_embedding, album["values"], album["lengths"])
+        artist_emb = self.artist_embedding(artist["values"], artist["lengths"])
+        album_emb = self.album_embedding(album["values"], album["lengths"])
 
         return {
             "seq_features": [seq_emb],
             "seq_masks": [seq_mask],
+            "seq_timestamps": [padded_ts],
             "ns_groups": [dense_enc, uid_emb, item_emb, artist_emb, album_emb],
         }

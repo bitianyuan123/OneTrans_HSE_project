@@ -4,6 +4,7 @@ def collate_fn(batch):
     out = dict()
     out["S"] = {
         "item_id": torch.cat([torch.tensor(x["S"]["item_id"], dtype=torch.long) for x in batch]),
+        "timestamps": torch.cat([torch.tensor(x["S"]["timestamps"], dtype=torch.long) for x in batch]),
         "lengths": torch.tensor([x["S"]["length"] for x in batch], dtype=torch.long)
     }
     out["NS"] = {

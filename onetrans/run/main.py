@@ -21,6 +21,11 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--max_users", type=int, default=None)
+    parser.add_argument("--merge", type=str, default="timestamp_agnostic",
+                        choices=["timestamp_aware", "timestamp_agnostic"])
+    parser.add_argument("--use_multihash", action="store_true")
+    parser.add_argument("--hash_cardinality", type=int, default=65536)
+    parser.add_argument("--num_hashes", type=int, default=2)
     return parser.parse_args()
 
 
@@ -44,7 +49,11 @@ def main():
 
     print("[3/5] Building model...")
     embedder, tokenizer, backbone = build_model(
-        archive, args.d_model, args.n_layers, args.n_heads, args.max_seq_len, device
+        archive, args.d_model, args.n_layers, args.n_heads, args.max_seq_len, device,
+        merge=args.merge,
+        use_multihash=args.use_multihash,
+        hash_cardinality=args.hash_cardinality,
+        num_hashes=args.num_hashes,
     )
     print(f"[4/5] Model built. Params: {sum(p.numel() for p in embedder.parameters()) + sum(p.numel() for p in tokenizer.parameters()) + sum(p.numel() for p in backbone.parameters()):,}")
 

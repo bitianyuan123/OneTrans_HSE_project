@@ -118,6 +118,7 @@ class BinaryRankinSequentialDataset(Dataset):
                 "item_id" : self.archive.histories[uid][start:t],
                 "album_ids" : self.archive.album_ids[uid][start:t],
                 "artist_ids" : self.archive.artist_ids[uid][start:t],
+                "timestamps" : self.archive.timestamps[uid][start:t],
                 "length" : t - start
             },
             "NS" : {
