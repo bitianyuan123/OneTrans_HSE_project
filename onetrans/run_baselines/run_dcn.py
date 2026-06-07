@@ -139,6 +139,8 @@ def main():
         low_rank=args.low_rank,
         num_experts=args.num_experts
     )
+    model = model.to(device)
+
     print(f"[4/5] Model built. Params: {sum(p.numel() for p in model.parameters())}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
