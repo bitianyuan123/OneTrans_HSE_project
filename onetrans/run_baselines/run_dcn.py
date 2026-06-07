@@ -4,6 +4,7 @@ import wandb
 from sklearn.metrics import roc_auc_score
 from torch import nn
 import polars as pl
+from tqdm import tqdm
 
 from onetrans.baselines.dcn_v2 import DCNV2
 from onetrans.data.transforms import ToDevice
@@ -19,7 +20,7 @@ def train_epoch(model: DCNV2, loader, optimizer, scaler, device):
     total_loss = 0.0
     all_labels, all_probs, all_uids = [], [], []
 
-    for batch in loader:
+    for batch in  tqdm(loader):
         batch = ToDevice(device)(batch)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -61,7 +62,7 @@ def eval_epoch(model: DCNV2, loader, device):
     total_loss = 0.0
     all_labels, all_probs, all_uids = [], [], []
 
-    for batch in loader:
+    for batch in tqdm(loader):
         batch = ToDevice(device)(batch)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             logits = model(batch["NS"])
