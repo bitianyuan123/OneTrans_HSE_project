@@ -4,6 +4,7 @@ import numpy as np
 import wandb
 import polars as pl
 from sklearn.metrics import roc_auc_score
+from torch import nn
 
 from onetrans.baselines.catboost_model import CatBoostModel
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
@@ -62,13 +63,12 @@ def main():
     all_uids = test_listens["uid"].to_numpy()
 
     val_metrics = {
-        # "val/loss": total_loss / len(loader),
         "val/auc_like": roc_auc_score(test_listens["is_like"].to_numpy().astype(np.int32), probs),
         "val/auc_full_play": roc_auc_score(test_listens["is_full_play"].to_numpy().astype(np.int32), probs),
         "val/uauc_like": uauc(test_listens["is_like"].to_numpy().astype(np.int32), probs, all_uids),
         "val/uauc_full_play": uauc(test_listens["is_full_play"].to_numpy().astype(np.int32), probs, all_uids),
     }
-    metrics = {**val_metrics}
+    metrics = {**val_metrics, "epoch": 1}
     wandb.log(metrics)
 
     wandb.finish()
