@@ -21,6 +21,7 @@ class DatasetConfig:
     interaction_name: str = 'multi_event'
     default_like_window_seconds: int = 24 * 60 * 60
     lag_seconds: int = 15 * 60
+    session_gap_seconds: int = 15 * 60
     batch_size : int = 8
     num_workers : int = 0
     max_users: int = None  # subsample N users; None = use all
