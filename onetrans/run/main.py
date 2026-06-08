@@ -3,10 +3,14 @@ import torch
 import wandb
 from torch.utils.data import DataLoader
 
+import torch.nn as nn
+
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.builder import build_model
-from onetrans.run.train import train_epoch, eval_epoch
+from onetrans.run.train import train_epoch, eval_epoch, _forward
 from onetrans.run.config import DatasetConfig
+from onetrans.data.transforms import ToDevice
+from onetrans.utils.profiling import profile_model
 
 
 def parse_args():
@@ -61,10 +65,40 @@ def main():
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
+    print("Profiling model (params / FLOPs / inference)...")
+    modules = {"embedder": embedder, "tokenizer": tokenizer, "backbone": backbone}
+    sample_batch = ToDevice(device)(next(iter(train_loader)))
+    sample_n = sample_batch["targets"]["is_like"].shape[0]
+    criterion = nn.BCEWithLogitsLoss()
+
+    def _forward_only():
+        return _forward(embedder, tokenizer, backbone, sample_batch)
+
+    def _train_step():
+        logits, labels = _forward(embedder, tokenizer, backbone, sample_batch)
+        criterion(logits, labels).backward()
+
+    profile_metrics = profile_model(modules, _forward_only, _train_step, sample_n, device)
+    optimizer.zero_grad(set_to_none=True)
+    wandb.summary.update(profile_metrics)
+    flops_per_sample = profile_metrics["flops/train_step_per_sample"]
+    print(
+        f"Params: {profile_metrics['params/total']:,} | "
+        f"fwd FLOPs/sample: {profile_metrics['flops/forward_per_sample']:.3e} | "
+        f"train FLOPs/sample: {flops_per_sample:.3e} | "
+        f"inference: {profile_metrics['inference/latency_ms']:.2f} ms, "
+        f"{profile_metrics['inference/peak_memory_mb']:.1f} MB"
+    )
+
     print("[5/5] Starting training...")
+    flops_so_far = 0.0
     for epoch in range(args.n_epochs):
         print(f"  Epoch {epoch+1}: running train_epoch...")
-        train_metrics = train_epoch(embedder, tokenizer, backbone, train_loader, optimizer, scaler, device)
+        train_metrics = train_epoch(
+            embedder, tokenizer, backbone, train_loader, optimizer, scaler, device,
+            flops_per_sample=flops_per_sample, flops_so_far=flops_so_far,
+        )
+        flops_so_far = train_metrics["train/cumulative_flops"]
         print(f"  Epoch {epoch+1}: running eval_epoch...")
         val_metrics = eval_epoch(embedder, tokenizer, backbone, test_loader, device)
 

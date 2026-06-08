@@ -18,7 +18,8 @@ def _forward(embedder, tokenizer, backbone, batch):
     return logits, labels
 
 
-def train_epoch(embedder, tokenizer, backbone, loader, optimizer, scaler, device):
+def train_epoch(embedder, tokenizer, backbone, loader, optimizer, scaler, device,
+                flops_per_sample=0.0, flops_so_far=0.0):
     embedder.train(); tokenizer.train(); backbone.train()
     criterion = nn.BCEWithLogitsLoss()
 
@@ -41,7 +42,8 @@ def train_epoch(embedder, tokenizer, backbone, loader, optimizer, scaler, device
         all_labels.append(labels.detach().cpu())
         all_probs.append(logits.sigmoid().detach().cpu())
         all_uids.append(batch["NS"]["sparse_features"]["uid"].cpu())
-        wandb.log({"train/loss_step": loss.item()})
+        flops_so_far += flops_per_sample * labels.shape[0]
+        wandb.log({"train/loss_step": loss.item(), "train/cumulative_flops": flops_so_far})
 
     all_labels = torch.cat(all_labels).float().numpy()
     all_probs = torch.cat(all_probs).float().numpy()
@@ -52,6 +54,7 @@ def train_epoch(embedder, tokenizer, backbone, loader, optimizer, scaler, device
         "train/auc_full_play": roc_auc_score(all_labels[:, 1], all_probs[:, 1]),
         "train/uauc_like": uauc(all_labels[:, 0], all_probs[:, 0], all_uids),
         "train/uauc_full_play": uauc(all_labels[:, 1], all_probs[:, 1], all_uids),
+        "train/cumulative_flops": flops_so_far,
     }
 
 
