@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--use_multihash", action="store_true")
     parser.add_argument("--hash_cardinality", type=int, default=65536)
     parser.add_argument("--num_hashes", type=int, default=2)
+    parser.add_argument("--pairwise_accuracy", action="store_true")
     return parser.parse_args()
 
 
@@ -102,10 +103,14 @@ def main():
         train_metrics = train_epoch(
             embedder, tokenizer, backbone, train_loader, optimizer, scaler, device,
             flops_per_sample=flops_per_sample, flops_so_far=flops_so_far,
+            pairwise_accuracy=args.pairwise_accuracy,
         )
         flops_so_far = train_metrics["train/cumulative_flops"]
         print(f"  Epoch {epoch+1}: running eval_epoch...")
-        val_metrics = eval_epoch(embedder, tokenizer, backbone, test_loader, device)
+        val_metrics = eval_epoch(
+            embedder, tokenizer, backbone, test_loader, device,
+            pairwise_accuracy=args.pairwise_accuracy,
+        )
 
         metrics = {**train_metrics, **val_metrics, "epoch": epoch + 1}
         wandb.log(metrics)

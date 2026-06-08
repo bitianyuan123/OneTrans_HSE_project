@@ -10,17 +10,17 @@ from onetrans.baselines.dcn_v2 import DCNV2
 from onetrans.data.transforms import ToDevice
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, DENSE_COLUMNS
-from onetrans.utils.metrics import uauc
+from onetrans.utils.metrics import uauc, compute_pairwise_accuracy
 
 
-def train_epoch(model: DCNV2, loader, optimizer, scaler, device):
+def train_epoch(model: DCNV2, loader, optimizer, scaler, device, pairwise_accuracy=False):
     model.train()
     criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
-    all_labels, all_probs, all_uids = [], [], []
+    all_labels, all_probs, all_uids, all_timestamps = [], [], [], []
 
-    for batch in  tqdm(loader):
+    for batch in tqdm(loader):
         batch = ToDevice(device)(batch)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -40,27 +40,38 @@ def train_epoch(model: DCNV2, loader, optimizer, scaler, device):
         all_labels.append(labels.detach().cpu())
         all_probs.append(logits.sigmoid().detach().cpu())
         all_uids.append(batch["NS"]["sparse_features"]["uid"].cpu())
+        all_timestamps.append(batch["NS"]["timestamp"].cpu())
         wandb.log({"train/loss_step": loss.item()})
 
     all_labels = torch.cat(all_labels).float().numpy()
     all_probs = torch.cat(all_probs).float().numpy()
     all_uids = torch.cat(all_uids).numpy()
-    return {
+    all_timestamps = torch.cat(all_timestamps).numpy()
+
+    metrics = {
         "train/loss": total_loss / len(loader),
         "train/auc_like": roc_auc_score(all_labels[:, 0], all_probs[:, 0]),
         "train/auc_full_play": roc_auc_score(all_labels[:, 1], all_probs[:, 1]),
         "train/uauc_like": uauc(all_labels[:, 0], all_probs[:, 0], all_uids),
         "train/uauc_full_play": uauc(all_labels[:, 1], all_probs[:, 1], all_uids),
     }
+    if pairwise_accuracy:
+        metrics["train/pairwise_acc_like"] = compute_pairwise_accuracy(
+            all_uids, all_timestamps, all_labels[:, 0], all_probs[:, 0]
+        )
+        metrics["train/pairwise_acc_full_play"] = compute_pairwise_accuracy(
+            all_uids, all_timestamps, all_labels[:, 1], all_probs[:, 1]
+        )
+    return metrics
 
 
 @torch.no_grad()
-def eval_epoch(model: DCNV2, loader, device):
+def eval_epoch(model: DCNV2, loader, device, pairwise_accuracy=False):
     model.eval()
     criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
-    all_labels, all_probs, all_uids = [], [], []
+    all_labels, all_probs, all_uids, all_timestamps = [], [], [], []
 
     for batch in tqdm(loader):
         batch = ToDevice(device)(batch)
@@ -74,17 +85,28 @@ def eval_epoch(model: DCNV2, loader, device):
         all_labels.append(labels.cpu())
         all_probs.append(logits.sigmoid().cpu())
         all_uids.append(batch["NS"]["sparse_features"]["uid"].cpu())
+        all_timestamps.append(batch["NS"]["timestamp"].cpu())
 
     all_labels = torch.cat(all_labels).float().numpy()
     all_probs = torch.cat(all_probs).float().numpy()
     all_uids = torch.cat(all_uids).numpy()
-    return {
+    all_timestamps = torch.cat(all_timestamps).numpy()
+
+    metrics = {
         "val/loss": total_loss / len(loader),
         "val/auc_like": roc_auc_score(all_labels[:, 0], all_probs[:, 0]),
         "val/auc_full_play": roc_auc_score(all_labels[:, 1], all_probs[:, 1]),
         "val/uauc_like": uauc(all_labels[:, 0], all_probs[:, 0], all_uids),
         "val/uauc_full_play": uauc(all_labels[:, 1], all_probs[:, 1], all_uids),
     }
+    if pairwise_accuracy:
+        metrics["val/pairwise_acc_like"] = compute_pairwise_accuracy(
+            all_uids, all_timestamps, all_labels[:, 0], all_probs[:, 0]
+        )
+        metrics["val/pairwise_acc_full_play"] = compute_pairwise_accuracy(
+            all_uids, all_timestamps, all_labels[:, 1], all_probs[:, 1]
+        )
+    return metrics
 
 
 def parse_args():
@@ -101,6 +123,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--max_users", type=int, default=None)
+    parser.add_argument("--pairwise_accuracy", action="store_true")
     return parser.parse_args()
 
 
@@ -150,9 +173,11 @@ def main():
     print("[5/5] Starting training...")
     for epoch in range(args.n_epochs):
         print(f"  Epoch {epoch+1}: running train_epoch...")
-        train_metrics = train_epoch(model, train_loader, optimizer, scaler, device)
+        train_metrics = train_epoch(model, train_loader, optimizer, scaler, device,
+                                    pairwise_accuracy=args.pairwise_accuracy)
         print(f"  Epoch {epoch+1}: running eval_epoch...")
-        val_metrics = eval_epoch(model, test_loader, device)
+        val_metrics = eval_epoch(model, test_loader, device,
+                                 pairwise_accuracy=args.pairwise_accuracy)
 
         metrics = {**train_metrics, **val_metrics, "epoch": epoch + 1}
         wandb.log(metrics)

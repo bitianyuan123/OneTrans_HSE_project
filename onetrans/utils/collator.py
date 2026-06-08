@@ -12,6 +12,7 @@ def collate_fn(batch):
             "uid" : torch.tensor([x["NS"]["sparse_features"]["uid"] for x in batch], dtype=torch.long),
             "item_id" : torch.tensor([x["NS"]["sparse_features"]["item_id"] for x in batch], dtype=torch.long)
         },
+        "timestamp": torch.tensor([x["NS"]["timestamp"] for x in batch], dtype=torch.long),
         "dense_features" : torch.cat([torch.tensor(x["NS"]["dense_features"]).unsqueeze(0) for x in batch], dim=0),
         "multivalent_features" : {
             "album_ids" : {
