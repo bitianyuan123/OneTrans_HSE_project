@@ -39,30 +39,33 @@ class RankMixerBackbone(nn.Module):
 
 
 class RankMixerTokenizer(nn.Module):
-    """
-    Wraps YambdaEmbedder output, concatenates all field embeddings,
-    and applies SemanticTokenizer.
-    """
     def __init__(self, embedder: YambdaEmbedder, num_tokens: int, token_dim: int):
         super().__init__()
         self.embedder = embedder
-        # Total dimension after concatenation:
-        #   seq_out (embedder.seq_in_dim) + sum(ns_group_dims) + maybe additional?
-        # YambdaEmbedder returns a tuple: (seq_emb, ns_embs_list)
-        # We'll compute total_dim = embedder.seq_in_dim + sum(embedder.ns_group_dims)
-        total_dim = embedder.seq_in_dim + sum(embedder.ns_group_dims)
+        # total_dim = агрегированный seq (D) + сумма размерностей ns_groups
+        total_dim = embedder.embed_dim + sum(embedder.ns_group_dims)
         self.semantic_tokenizer = SemanticTokenizer(total_dim, num_tokens, token_dim)
 
     def forward(self, batch: Dict) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # Get embeddings from YambdaEmbedder
-        seq_emb, ns_embs = self.embedder(batch)   # seq_emb: (B, seq_in_dim)
-                                                   # ns_embs: list of tensors each (B, group_dim)
-        # Concatenate along feature dimension
-        concat_vec = torch.cat([seq_emb] + ns_embs, dim=-1)  # (B, total_dim)
-        tokens = self.semantic_tokenizer(concat_vec)        # (B, T, D)
-        # dummy mask (all ones) for compatibility with OneTrans API
+        out = self.embedder(batch)   # словарь
+        # --- последовательность (S) ---
+        seq_emb = out["seq_features"][0]   # (B, L, D)
+        seq_mask = out["seq_masks"][0]     # (B, L)
+        # усредняем по реальной длине (игнорируем паддинг)
+        seq_len = seq_mask.sum(dim=1, keepdim=True)   # (B, 1)
+        seq_pooled = (seq_emb * seq_mask.unsqueeze(-1)).sum(dim=1) / seq_len.clamp(min=1)  # (B, D)
+
+        # --- не последовательные группы (NS) ---
+        ns_embs = out["ns_groups"]   # список тензоров, каждый (B, dim_i)
+
+        # --- конкатенация ---
+        concat_vec = torch.cat([seq_pooled] + ns_embs, dim=-1)  # (B, total_dim)
+        tokens = self.semantic_tokenizer(concat_vec)            # (B, T, D)
+
+        # фиктивная маска для совместимости с API (все единицы)
         mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
         return tokens, mask
+
 
 def build_rankmixer_model(
     archive,
