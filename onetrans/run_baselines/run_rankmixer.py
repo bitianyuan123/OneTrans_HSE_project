@@ -42,29 +42,37 @@ class RankMixerTokenizer(nn.Module):
     def __init__(self, embedder: YambdaEmbedder, num_tokens: int, token_dim: int):
         super().__init__()
         self.embedder = embedder
-        # total_dim = агрегированный seq (D) + сумма размерностей ns_groups
-        total_dim = embedder.embed_dim + sum(embedder.ns_group_dims)
-        self.semantic_tokenizer = SemanticTokenizer(total_dim, num_tokens, token_dim)
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+
+        # Общая размерность входного вектора
+        total_in = embedder.embed_dim + sum(embedder.ns_group_dims)
+        # Линейная проекция на T * D
+        self.projection = nn.Linear(total_in, num_tokens * token_dim)
 
     def forward(self, batch: Dict) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        out = self.embedder(batch)   # словарь
-        # --- последовательность (S) ---
-        seq_emb = out["seq_features"][0]   # (B, L, D)
-        seq_mask = out["seq_masks"][0]     # (B, L)
-        # усредняем по реальной длине (игнорируем паддинг)
-        seq_len = seq_mask.sum(dim=1, keepdim=True)   # (B, 1)
+        out = self.embedder(batch)
+
+        # --- Последовательность (усреднение с маской) ---
+        seq_emb = out["seq_features"][0]  # (B, L, D)
+        seq_mask = out["seq_masks"][0]  # (B, L)
+        seq_len = seq_mask.sum(dim=1, keepdim=True)
         seq_pooled = (seq_emb * seq_mask.unsqueeze(-1)).sum(dim=1) / seq_len.clamp(min=1)  # (B, D)
 
-        # --- не последовательные группы (NS) ---
-        ns_embs = out["ns_groups"]   # список тензоров, каждый (B, dim_i)
+        # --- Непоследовательные группы ---
+        ns_embs = out["ns_groups"]  # список из 5 тензоров, каждый (B, dim_i)
 
-        # --- конкатенация ---
-        concat_vec = torch.cat([seq_pooled] + ns_embs, dim=-1)  # (B, total_dim)
-        tokens = self.semantic_tokenizer(concat_vec)            # (B, T, D)
+        # --- Конкатенация ---
+        concat_vec = torch.cat([seq_pooled] + ns_embs, dim=-1)  # (B, total_in)
 
-        # фиктивная маска для совместимости с API (все единицы)
+        # --- Проекция и формирование токенов ---
+        x = self.projection(concat_vec)  # (B, T * D)
+        tokens = x.view(-1, self.num_tokens, self.token_dim)  # (B, T, D)
+
+        # Фиктивная маска для совместимости с API
         mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
         return tokens, mask
+
 
 
 def build_rankmixer_model(
