@@ -8,7 +8,7 @@ from sklearn.metrics import roc_auc_score
 from onetrans.baselines.catboost_model import CatBoostModel
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, SPARSE_COLUMNS, DENSE_COLUMNS
-from onetrans.utils.metrics import uauc
+from onetrans.utils.metrics import uauc, compute_pairwise_accuracy
 
 
 def build_catboost_df(sequences, archive):
@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--max_users", type=int, default=None)
+    parser.add_argument("--pairwise_accuracy", action="store_true")
     return parser.parse_args()
 
 
@@ -83,12 +84,23 @@ def main():
     fp_probs = fp_model.fit_predict(X_train=X_train, X_test=X_test, y_train=y_fp_train)
 
     print("[5/5] Computing metrics...")
+    test_labels_like = test_df["is_like"].to_numpy().astype(np.int32)
+    test_labels_fp   = test_df["is_full_play"].to_numpy().astype(np.int32)
+    test_timestamps  = test_df["timestamp"].to_numpy()
+
     val_metrics = {
-        "val/auc_like": roc_auc_score(test_df["is_like"].to_numpy().astype(np.int32), like_probs),
-        "val/auc_full_play": roc_auc_score(test_df["is_full_play"].to_numpy().astype(np.int32), fp_probs),
-        "val/uauc_like": uauc(test_df["is_like"].to_numpy().astype(np.int32), like_probs, all_uids),
-        "val/uauc_full_play": uauc(test_df["is_full_play"].to_numpy().astype(np.int32), fp_probs, all_uids),
+        "val/auc_like":       roc_auc_score(test_labels_like, like_probs),
+        "val/auc_full_play":  roc_auc_score(test_labels_fp, fp_probs),
+        "val/uauc_like":      uauc(test_labels_like, like_probs, all_uids),
+        "val/uauc_full_play": uauc(test_labels_fp, fp_probs, all_uids),
     }
+    if args.pairwise_accuracy:
+        val_metrics["val/pairwise_acc_like"] = compute_pairwise_accuracy(
+            all_uids, test_timestamps, test_labels_like, like_probs
+        )
+        val_metrics["val/pairwise_acc_full_play"] = compute_pairwise_accuracy(
+            all_uids, test_timestamps, test_labels_fp, fp_probs
+        )
     wandb.log({**val_metrics, "epoch": 1})
     print(
         f"val AUC like {val_metrics['val/auc_like']:.4f} | "
