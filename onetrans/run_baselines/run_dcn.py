@@ -6,7 +6,7 @@ from torch import nn
 import polars as pl
 from tqdm import tqdm
 
-from onetrans.baselines.dcn_v2 import DCNV2
+from onetrans.models.dcn_v2 import DCNV2
 from onetrans.utils.transforms import ToDevice
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, DENSE_COLUMNS
