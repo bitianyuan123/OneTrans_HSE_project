@@ -9,7 +9,7 @@ from onetrans.nn.encoders.multihash import (
 )
 from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
 from onetrans.nn.tokenizer import STokenizer, NSGroupWiseTokenizer, NSAutoSplitTokenizer, OneTransTokenizer
-from onetrans.nn.models.one_trans import OneTrans
+from onetrans.baselines.one_trans import OneTrans
 from onetrans.run.config import DENSE_COLUMNS
 
 
