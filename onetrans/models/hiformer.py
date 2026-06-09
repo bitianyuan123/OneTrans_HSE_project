@@ -10,27 +10,22 @@ from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
 class Hiformer(nn.Module):
     def __init__(
         self,
-        # Данные
         num_users: int,
         num_items: int,
         num_artists: int,
         num_albums: int,
         dense_train_df,
-        # Размерности
-        embedding_size: int = 64,          # размер эмбеддингов категориальных признаков (из CategoricalEncoder)
-        d_model: int = 128,                # внутренняя размерность Hiformer
+        embedding_size: int = 64,
+        d_model: int = 128,
         n_heads: int = 4,
-        n_dense_embeddings: int = 8,       # во сколько эмбеддингов сворачиваются плотные признаки (n^D)
-        # Параметры слоёв
+        n_dense_embeddings: int = 8,
         num_layers: int = 2,
-        rank_k: int = 128,                 # rank для low‑rank composite keys
-        rank_v: int = 1024,                # rank для low‑rank composite values
-        use_pruning_last: bool = True,     # применять pruning на последнем слое
+        rank_k: int = 128,
+        rank_v: int = 1024,
+        use_pruning_last: bool = True,
         dropout: float = 0.1,
-        # Параметры PiecewiseLinearEncoder
         n_bins: int = 32,
         train_df_slice: int = 1_000_000,
-        # Задача
         output_size: int = 2,
     ):
         super().__init__()
@@ -47,26 +42,21 @@ class Hiformer(nn.Module):
         )
         dense_raw_dim = sum(self.piecewise_encoder.n_bins)
 
-        # ---------- Агрегация плотных признаков в n_dense_embeddings ----------
-        # Используем MLP, который из dense_raw_dim выдаёт n_dense_embeddings * d_model
         self.dense_aggregator = nn.Sequential(
             nn.Linear(dense_raw_dim, 512),
             nn.ReLU(),
             nn.Linear(512, n_dense_embeddings * d_model)
         )
 
-        # ---------- Проекции категориальных эмбеддингов (embedding_size -> d_model) ----------
         self.user_proj = nn.Linear(embedding_size, d_model)
         self.item_proj = nn.Linear(embedding_size, d_model)
         self.artist_proj = nn.Linear(embedding_size, d_model)
         self.album_proj = nn.Linear(embedding_size, d_model)
 
-        # ---------- Task token (CLS) ----------
         self.task_token = nn.Parameter(torch.randn(1, 1, d_model))
 
-        # Общее число признаков на входе Hiformer:
         # 1 task token + 1 user + 1 item + 1 artist + 1 album + n_dense_embeddings
-        self.num_features = 1 + 1 + 1 + 1 + 1 + n_dense_embeddings   # = 5 + n_dense_embeddings
+        self.num_features = 1 + 1 + 1 + 1 + 1 + n_dense_embeddings
 
         self.layers = nn.ModuleList()
         for i in range(num_layers):
@@ -78,7 +68,6 @@ class Hiformer(nn.Module):
                 rank_v=rank_v,
                 dropout=dropout
             ))
-        # ---------- Выходная голова ----------
         self.output_layer = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, 64),
@@ -87,8 +76,7 @@ class Hiformer(nn.Module):
         )
 
     def forward(self, inputs: dict) -> torch.Tensor:
-        # 1. Получаем эмбеддинги через ваши энкодеры
-        user_emb = self.user_encoder(inputs["sparse_features"]["uid"])                 # [B, emb]
+        user_emb = self.user_encoder(inputs["sparse_features"]["uid"])
         item_emb = self.item_encoder(inputs["sparse_features"]["item_id"])
         artist_emb = self.artist_encoder(
             inputs["multivalent_features"]["artist_ids"]["values"],
@@ -100,11 +88,9 @@ class Hiformer(nn.Module):
         )
         dense_raw = self.piecewise_encoder(inputs["dense_features"])                   # [B, dense_raw_dim]
 
-        # 2. Агрегируем плотные признаки в n_dense_embeddings векторов размерности d_model
         dense_emb = self.dense_aggregator(dense_raw)                                   # [B, n_dense * d_model]
         dense_emb = dense_emb.view(-1, self.n_dense_embeddings, self.d_model)        # [B, n_dense, d_model]
 
-        # 3. Проецируем категориальные эмбеддинги в d_model
         user_emb = self.user_proj(user_emb).unsqueeze(1)                               # [B, 1, d_model]
         item_emb = self.item_proj(item_emb).unsqueeze(1)
         artist_emb = self.artist_proj(artist_emb).unsqueeze(1)
@@ -114,14 +100,11 @@ class Hiformer(nn.Module):
         task = self.task_token.expand(user_emb.size(0), -1, -1)                        # [B, 1, d_model]
         seq = torch.cat([task, user_emb, item_emb, artist_emb, album_emb, dense_emb], dim=1)  # [B, L, d_model]
 
-        # 5. Пропускаем через стэк слоёв Hiformer
         for layer in self.layers:
             seq = layer(seq)
 
-        # 6. Берём выход task token (первый в последовательности)
         task_out = seq[:, 0, :]   # [B, d_model]
 
-        # 7. Предсказание
         logits = self.output_layer(task_out)
         return logits
 
