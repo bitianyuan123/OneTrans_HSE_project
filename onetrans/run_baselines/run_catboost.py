@@ -19,6 +19,7 @@ def build_catboost_df(sequences, archive):
     df = df.with_columns([
         pl.Series("uid", [uid for uid, _ in sequences], dtype=pl.Int64),
         pl.Series("item_id", [archive.histories[uid][t] for uid, t in sequences], dtype=pl.Int64),
+        pl.Series("timestamp", [archive.timestamps[uid][t] for uid, t in sequences], dtype=pl.Int64),
         pl.Series("is_like", [archive.target_likes[uid][t] for uid, t in sequences]),
         pl.Series("is_full_play", [archive.target_full_plays[uid][t] for uid, t in sequences]),
     ])
