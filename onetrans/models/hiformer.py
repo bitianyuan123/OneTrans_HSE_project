@@ -86,19 +86,19 @@ class Hiformer(nn.Module):
             inputs["multivalent_features"]["album_ids"]["values"],
             inputs["multivalent_features"]["album_ids"]["lengths"]
         )
-        dense_raw = self.piecewise_encoder(inputs["dense_features"])                   # [B, dense_raw_dim]
+        dense_raw = self.piecewise_encoder(inputs["dense_features"]) # [B, dense_raw_dim]
 
-        dense_emb = self.dense_aggregator(dense_raw)                                   # [B, n_dense * d_model]
-        dense_emb = dense_emb.view(-1, self.n_dense_embeddings, self.d_model)        # [B, n_dense, d_model]
+        dense_emb = self.dense_aggregator(dense_raw) # [B, n_dense * d_model]
+        dense_emb = dense_emb.view(-1, self.n_dense_embeddings, self.d_model) # [B, n_dense, d_model]
 
-        user_emb = self.user_proj(user_emb).unsqueeze(1)                               # [B, 1, d_model]
+        user_emb = self.user_proj(user_emb).unsqueeze(1) # [B, 1, d_model]
         item_emb = self.item_proj(item_emb).unsqueeze(1)
         artist_emb = self.artist_proj(artist_emb).unsqueeze(1)
         album_emb = self.album_proj(album_emb).unsqueeze(1)
 
-        # 4. Формируем последовательность: [task_token, user, item, artist, album, ...dense_embeddings...]
-        task = self.task_token.expand(user_emb.size(0), -1, -1)                        # [B, 1, d_model]
-        seq = torch.cat([task, user_emb, item_emb, artist_emb, album_emb, dense_emb], dim=1)  # [B, L, d_model]
+        # [task_token, user, item, artist, album, ...dense_embeddings...]
+        task = self.task_token.expand(user_emb.size(0), -1, -1) # [B, 1, d_model]
+        seq = torch.cat([task, user_emb, item_emb, artist_emb, album_emb, dense_emb], dim=1)
 
         for layer in self.layers:
             seq = layer(seq)
