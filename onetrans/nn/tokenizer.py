@@ -118,16 +118,19 @@ class NSAutoSplitTokenizer(nn.Module):
 
 
 class OneTransTokenizer(nn.Module):
-    def __init__(self, s_tokenizer, ns_tokenizer, d_model, max_seq_len):
+    def __init__(self, s_tokenizer, ns_tokenizer, d_model, max_seq_len, use_cls_token=False):
         super().__init__()
         self.s_tokenizer = s_tokenizer
         self.ns_tokenizer = ns_tokenizer
         self.rms_norm = nn.RMSNorm(d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.use_cls_token = use_cls_token
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
     @property
     def n_ns_tokens(self):
-        return self.ns_tokenizer.n_ns_tokens
+        return self.ns_tokenizer.n_ns_tokens + (1 if self.use_cls_token else 0)
 
     def forward(self, batch):
         s_tokens, s_mask = self.s_tokenizer(
@@ -140,7 +143,12 @@ class OneTransTokenizer(nn.Module):
         s_tokens = s_tokens + self.pos_embedding(positions)
 
         ns_tokens = self.ns_tokenizer(batch["ns_groups"])
-        B, L_NS, _ = ns_tokens.shape
+
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(B, 1, -1)
+            ns_tokens = torch.cat([ns_tokens, cls_tokens], dim=1)
+
+        L_NS = ns_tokens.shape[1]
         ns_mask = torch.ones(B, L_NS, dtype=torch.bool, device=ns_tokens.device)
 
         tokens = torch.cat([s_tokens, ns_tokens], dim=1)

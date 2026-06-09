@@ -14,13 +14,15 @@ class OneTrans(nn.Module):
         min_seq_len : int = 10,
         ns_tokens_num : int = 8,
         dropout : float = 0.0,
-        dimensionality_reduction : str = "linear"
+        dimensionality_reduction : str = "linear",
+        use_cls_token : bool = False
     ):
         super().__init__()
         self.d_model = d_model
         self.num_blocks = num_blocks
         self.num_heads = num_heads
         self.ns_tokens_num = ns_tokens_num
+        self.use_cls_token = use_cls_token
         if dimensionality_reduction == "linear":
             self.dims = torch.linspace(max_seq_len, min_seq_len, num_blocks + 1, dtype=torch.long)
         elif dimensionality_reduction == "exponential":
@@ -47,6 +49,9 @@ class OneTrans(nn.Module):
         '''
         for block in self.blocks:
             x, mask = block(x, mask)
-        x = x[:, -self.ns_tokens_num:, :].mean(dim=1)
+        if self.use_cls_token:
+            x = x[:, -1, :]
+        else:
+            x = x[:, -self.ns_tokens_num:, :].mean(dim=1)
         x = self.linear(x)
         return x

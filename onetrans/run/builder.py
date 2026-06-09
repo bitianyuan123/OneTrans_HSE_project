@@ -9,7 +9,7 @@ from onetrans.nn.encoders.multihash import (
 )
 from onetrans.nn.encoders.piecewise import PiecewiseLinearEncoder
 from onetrans.nn.tokenizer import STokenizer, NSGroupWiseTokenizer, NSAutoSplitTokenizer, OneTransTokenizer
-from onetrans.baselines.one_trans import OneTrans
+from onetrans.models.one_trans import OneTrans
 from onetrans.run.config import DENSE_COLUMNS
 
 
@@ -26,6 +26,7 @@ def build_model(
     num_hashes=2,
     ns_tokenizer="groupwise",
     l_ns=5,
+    use_cls_token=False,
 ):
     if use_multihash:
         item_embedding = MultihashEmbedding(hash_cardinality, d_model, num_hashes)
@@ -56,14 +57,15 @@ def build_model(
         ns_tok = NSAutoSplitTokenizer(d_model, l_ns=l_ns, in_dims=embedder.ns_group_dims)
     else:
         ns_tok = NSGroupWiseTokenizer(d_model, in_dims=embedder.ns_group_dims)
-    tokenizer = OneTransTokenizer(s_tok, ns_tok, d_model, max_seq_len)
+    tokenizer = OneTransTokenizer(s_tok, ns_tok, d_model, max_seq_len, use_cls_token=use_cls_token)
 
     backbone = OneTrans(
         d_model=d_model,
         num_blocks=n_layers,
         num_heads=n_heads,
         max_seq_len=max_seq_len,
-        ns_tokens_num=ns_tok.n_ns_tokens,
+        ns_tokens_num=tokenizer.n_ns_tokens,
+        use_cls_token=use_cls_token,
     )
 
     return embedder.to(device), tokenizer.to(device), backbone.to(device)

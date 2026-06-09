@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--ns_tokenizer", type=str, default="groupwise",
                         choices=["groupwise", "autosplit"])
     parser.add_argument("--l_ns", type=int, default=5)
+    parser.add_argument("--use_cls_token", action="store_true")
     parser.add_argument("--use_multihash", action="store_true")
     parser.add_argument("--hash_cardinality", type=int, default=65536)
     parser.add_argument("--num_hashes", type=int, default=2)
@@ -63,6 +64,7 @@ def main():
         num_hashes=args.num_hashes,
         ns_tokenizer=args.ns_tokenizer,
         l_ns=args.l_ns,
+        use_cls_token=args.use_cls_token,
     )
     print(f"[4/5] Model built. Params: {sum(p.numel() for p in embedder.parameters()) + sum(p.numel() for p in tokenizer.parameters()) + sum(p.numel() for p in backbone.parameters()):,}")
 
