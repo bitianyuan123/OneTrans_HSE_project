@@ -6,7 +6,7 @@ import wandb
 from torch import nn
 import polars as pl
 
-from onetrans.baselines.rank_mixer import RankMixerBlock
+from onetrans.models.rank_mixer import RankMixerBlock
 from onetrans.utils.transforms import ToDevice
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.ext.yambda.embedder import YambdaEmbedder

@@ -5,7 +5,7 @@ import wandb
 import polars as pl
 from sklearn.metrics import roc_auc_score
 
-from onetrans.baselines.catboost_model import CatBoostModel
+from onetrans.models.catboost_model import CatBoostModel
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, SPARSE_COLUMNS, DENSE_COLUMNS
 from onetrans.utils.metrics import uauc, compute_pairwise_accuracy
