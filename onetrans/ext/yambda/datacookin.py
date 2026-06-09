@@ -6,7 +6,7 @@ from onetrans.run.config import (
     # DENSE_COLUMNS, SPARSE_COLUMNS, MULTIVALENT_COLUMNS, LABEL_COLUMNS,
     TEST_INTERVAL_SECONDS, CORE_MIN_INTERACTIONS_PER_ITEM
 )
-from onetrans.data.transforms import (
+from onetrans.utils.transforms import (
     FeatureJoiner, 
     IdMapper,
     CoreFiltrator,
@@ -14,7 +14,6 @@ from onetrans.data.transforms import (
 )
 from onetrans.ext.yambda.dataset import BinaryRankinSequentialDataset, BinaryRankinArchive
 from onetrans.utils import collate_fn
-from onetrans.nn.encoders.multihash import MultihashTransform
 from typing import Tuple
 from datasets import Dataset, DatasetDict, load_dataset
 

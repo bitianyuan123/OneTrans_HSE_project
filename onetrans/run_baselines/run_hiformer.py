@@ -7,7 +7,7 @@ import polars as pl
 from tqdm import tqdm
 
 from onetrans.baselines.hiformer import Hiformer
-from onetrans.data.transforms import ToDevice
+from onetrans.utils.transforms import ToDevice
 from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.config import DatasetConfig, DENSE_COLUMNS
 from onetrans.utils.metrics import uauc

@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
-import numpy as np
 import wandb
-from onetrans.data.transforms import ToDevice
+from onetrans.utils.transforms import ToDevice
 from onetrans.utils.metrics import uauc, compute_pairwise_accuracy
 
 

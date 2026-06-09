@@ -10,39 +10,6 @@ class Transform:
         raise NotImplementedError
 
 
-class ToNumpy(Transform):
-    """ Convert all lists to numpy """
-
-    def __init__(self, dtype=np.int64):
-        super().__init__()
-        self._dtype = dtype
-
-    def __call__(self, sample):
-        res = {}
-        for key, value in sample.items():
-            if isinstance(value, dict):
-                res[key] = self.__call__(value)
-            elif isinstance(value, list):
-                res[key] = np.array(value, dtype=self._dtype)
-            else:
-                res[key] = value
-        return res
-
-
-class ToTorch(Transform):
-    """Convert all lists or numpy arrays in torch tensors."""
-
-    def __call__(self, obj):
-        if isinstance(obj, dict):
-            return {key: self.__call__(value) for key, value in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return torch.tensor(obj)
-        elif isinstance(obj, np.ndarray):
-            return torch.from_numpy(obj)
-        else:
-            return obj
-
-
 class ToDevice(Transform):
     """Move obj to device."""
 

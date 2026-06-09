@@ -1,7 +1,6 @@
 import argparse
 import torch
 import wandb
-from torch.utils.data import DataLoader
 
 import torch.nn as nn
 
@@ -9,7 +8,7 @@ from onetrans.ext.yambda.datacookin import DataCookinYambdaRank
 from onetrans.run.builder import build_model
 from onetrans.run.train import train_epoch, eval_epoch, _forward
 from onetrans.run.config import DatasetConfig
-from onetrans.data.transforms import ToDevice
+from onetrans.utils.transforms import ToDevice
 from onetrans.utils.profiling import profile_model
 
 
