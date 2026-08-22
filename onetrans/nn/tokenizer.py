@@ -132,26 +132,33 @@ class OneTransTokenizer(nn.Module):
     def n_ns_tokens(self):
         return self.ns_tokenizer.n_ns_tokens + (1 if self.use_cls_token else 0)
 
+    def encode_s(self, seq_features, seq_masks, seq_timestamps=None):
+        """仅编码 S（用户历史）侧，返回 RMSNorm 后的 S token 与掩码（nearline/Stage I）。"""
+        s_tokens, s_mask = self.s_tokenizer(seq_features, seq_masks, seq_timestamps)
+        B, L, _ = s_tokens.shape
+        positions = torch.arange(L, device=s_tokens.device).unsqueeze(0)
+        s_tokens = s_tokens + self.pos_embedding(positions)
+        return self.rms_norm(s_tokens), s_mask
+
+    def encode_ns(self, ns_groups):
+        """仅编码 NS（非序列/候选）侧，返回 RMSNorm 后的 NS token 与掩码（online/Stage II）。"""
+        ns_tokens = self.ns_tokenizer(ns_groups)
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(ns_tokens.shape[0], 1, -1)
+            ns_tokens = torch.cat([ns_tokens, cls_tokens], dim=1)
+        L_NS = ns_tokens.shape[1]
+        ns_mask = torch.ones(ns_tokens.shape[0], L_NS, dtype=torch.bool, device=ns_tokens.device)
+        return self.rms_norm(ns_tokens), ns_mask
+
     def forward(self, batch):
-        s_tokens, s_mask = self.s_tokenizer(
+        s_tokens, s_mask = self.encode_s(
             batch["seq_features"],
             batch["seq_masks"],
             batch.get("seq_timestamps"),
         )
-        B, L, _ = s_tokens.shape
-        positions = torch.arange(L, device=s_tokens.device).unsqueeze(0)
-        s_tokens = s_tokens + self.pos_embedding(positions)
-
-        ns_tokens = self.ns_tokenizer(batch["ns_groups"])
-
-        if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(B, 1, -1)
-            ns_tokens = torch.cat([ns_tokens, cls_tokens], dim=1)
-
-        L_NS = ns_tokens.shape[1]
-        ns_mask = torch.ones(B, L_NS, dtype=torch.bool, device=ns_tokens.device)
+        ns_tokens, ns_mask = self.encode_ns(batch["ns_groups"])
 
         tokens = torch.cat([s_tokens, ns_tokens], dim=1)
         mask = torch.cat([s_mask, ns_mask], dim=1)
 
-        return self.rms_norm(tokens), mask
+        return tokens, mask
