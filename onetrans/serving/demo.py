@@ -184,6 +184,48 @@ def test_tokenizer_split() -> None:
     print(f"tokenizer 拆分： [ok] encode_s {tuple(s_tokens.shape)} / encode_ns {tuple(ns_tokens.shape)} 与 forward 一致")
 
 
+def test_zero_copy() -> None:
+    """KV 零拷贝数据面：deserialize 视图底层缓冲 + mmap 后端读侧零拷贝。"""
+    import ctypes
+    import tempfile
+
+    from onetrans.serving.local_adapter import LocalKVStore
+    from onetrans.serving.kv_store import UserKVRecord
+
+    device = torch.device("cpu")
+    runner = _build_runner(seed=3)
+    s_emb, s_mask = _make_sequence(1, 29, device)
+    kv = runner.encode_s(s_emb, s_mask)
+    payload = serialize(kv.per_layer)
+
+    # 1) frombuffer 零拷贝：deserialize 返回的张量直接视图底层 bytearray（无副本）
+    buf = bytearray(payload)
+    restored = deserialize(buf)
+    carr = (ctypes.c_char * len(buf)).from_buffer(buf)
+    base, end = ctypes.addressof(carr), ctypes.addressof(carr) + len(buf)
+    ptr = restored[0][0].untyped_storage().data_ptr()
+    assert base <= ptr < end, f"零拷贝失败：张量未视图底层缓冲 ptr={ptr} base={base}"
+    for (k1, v1), (k2, v2) in zip(kv.per_layer, restored):
+        assert (k1 - k2).abs().max().item() < 1e-6
+        assert (v1 - v2).abs().max().item() < 1e-6
+
+    # 2) mmap 后端：payload 映射为 memoryview，get 返回共享内存视图
+    with tempfile.TemporaryDirectory() as mmap_dir:
+        store = LocalKVStore(dtype="float32", mmap_dir=mmap_dir)
+        key = KVKey(model_version="mv1", user_id="user1")
+        store.put(UserKVRecord(
+            key=key, s_len=kv.s_len, per_layer_len=kv.per_layer_len,
+            dtype="float32", payload=payload,
+        ))
+        rec = store.get(key)
+        assert rec is not None and isinstance(rec.payload, memoryview)
+        restored_mm = deserialize(rec.payload)
+        for (k1, v1), (k2, v2) in zip(kv.per_layer, restored_mm):
+            assert (k1 - k2).abs().max().item() < 1e-6
+            assert (v1 - v2).abs().max().item() < 1e-6
+    print("KV 零拷贝： [ok] frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致")
+
+
 def test_weight_loader() -> None:
     import tempfile
 
@@ -235,6 +277,7 @@ def main() -> None:
     test_tokenizer_split()
     test_append_conflict(lambda: build_kv_store(KVConfig(backend="local")))
     test_pipeline()
+    test_zero_copy()
     test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 
