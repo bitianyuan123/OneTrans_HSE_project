@@ -47,10 +47,10 @@ def _build_runner(seed: int = 0) -> TwoStageRunner:
 
 
 def _make_sequence(batch: int, valid_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """生成 right-padding 的 S 序列嵌入与掩码（前 valid_len 有效，其余为零）。"""
+    """生成 left-padding 的 S 序列嵌入与掩码（后 valid_len 有效，前部 padding 为零）。"""
     s = torch.randn(batch, MAX_SEQ_LEN, D_MODEL, device=device)
     mask = torch.zeros(batch, MAX_SEQ_LEN, dtype=torch.bool, device=device)
-    mask[:, :valid_len] = True
+    mask[:, MAX_SEQ_LEN - valid_len :] = True
     s = s * mask.unsqueeze(-1)
     return s, mask
 

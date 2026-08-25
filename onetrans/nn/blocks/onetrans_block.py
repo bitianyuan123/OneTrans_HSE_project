@@ -43,11 +43,14 @@ class CoreOneTransBlock(nn.Module):
         z = self.mixed_attn(self.norm(x), mask=mask) + x
         z = z + self.mixed_ffn(self.norm(z))
 
-        s_tokens = z[:, :self.out_seq_num, :]
+        # pyramid 缩层：保留「最新（尾部）」的 S token（论文 §3.4 的 tail index set
+        # Q = {S_in - out_seq_num + 1, ..., S_in}），而非最旧（头部）。配合左 padding。
+        s_in = x.shape[1] - self.ns_tokens_num
+        s_tokens = z[:, s_in - self.out_seq_num : s_in, :]
         ns_tokens = z[:, -self.ns_tokens_num:, :]
         z = torch.cat([s_tokens, ns_tokens], dim=1)
 
-        s_mask = mask[:, :self.out_seq_num]
+        s_mask = mask[:, s_in - self.out_seq_num : s_in]
         ns_mask = mask[:, -self.ns_tokens_num:]
         mask = torch.cat([s_mask, ns_mask], dim=1)
 

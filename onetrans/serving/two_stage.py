@@ -10,8 +10,8 @@
 拆分成立的前提：S token 位于序列前段且严格因果，其隐藏态与 K/V 与 NS 无关。
 故 S 侧可安全预计算；两阶段拼接后与单前向**数值等价**（见 demo 校验）。
 
-对应设计文档 §4.1。注意：pyramid 降层方向当前仍镜像仓库现状（保留头部），
-与论文「保留尾部」的差异见 ``docs/detailed_design.md`` §4.2 的仓库修正说明。
+对应设计文档 §4.1。pyramid 缩层方向已修正为「保留尾部（最新 token）」，
+S 侧统一采用左 padding（有效 token 靠后），见 ``docs/detailed_design.md`` §4.2 仓库修正。
 """
 
 from __future__ import annotations
@@ -30,12 +30,12 @@ class UserKV:
     """Stage I 产出：逐层 S 侧 K/V（未序列化的内存形态，B=1 单用户）。"""
 
     per_layer: list[tuple[Tensor, Tensor]]  # (K_s^l, V_s^l)，[1, S_l, H, d]
-    per_layer_len: list[int]  # 每层**有效** S token 数（右 padding 语义）
+    per_layer_len: list[int]  # 每层**有效** S token 数（左 padding 语义）
     s_len: int  # 原始有效历史长度（append offset 语义）
 
 
 def _s_attn_mask(s_mask: Tensor) -> Tensor:
-    """S 侧 causal 自注意力掩码：padding（列）+ 上三角因果。"""
+    """S 侧 causal 自注意力掩码：padding（列）+ 上三角因果（左 padding）。"""
     B, S = s_mask.shape
     device = s_mask.device
     m = torch.zeros(B, 1, S, S, device=device)
@@ -79,7 +79,7 @@ class TwoStageRunner:
         """编码用户历史，逐层缓存 K_s/V_s。
 
         :param s_emb: 已 tokenize + pos + RMSNorm 的 S 序列，[1, S0, D]，S0=dims[0]
-        :param s_mask: [1, S0] bool 有效掩码（右 padding，有效 token 在前）
+        :param s_mask: [1, S0] bool 有效掩码（左 padding，有效 token 靠后）
         """
         if s_emb.shape[0] != 1:
             raise ValueError("encode_s 只支持单用户 B=1（nearline 按 user 分区）")
@@ -108,9 +108,10 @@ class TwoStageRunner:
             z = attn + s
             z = z + block.mixed_ffn.network_s(block.norm(z))
 
-            # pyramid 降层：镜像现状（保留头部）；TODO 论文为保留尾部
-            s = z[:, : block.out_seq_num, :]
-            smask = smask[:, : block.out_seq_num]
+            # pyramid 降层：保留「最新（尾部）」的 S token（论文 §3.4 tail，配合左 padding）
+            s_in = s.shape[1]
+            s = z[:, s_in - block.out_seq_num : s_in, :]
+            smask = smask[:, s_in - block.out_seq_num : s_in]
             S = block.out_seq_num
 
         return UserKV(per_layer=per_layer, per_layer_len=per_layer_len, s_len=s_len)
@@ -139,8 +140,8 @@ class TwoStageRunner:
             valid_l = kv.per_layer_len[l]
             s_mask = torch.cat(
                 [
-                    torch.ones(B, valid_l, dtype=torch.bool, device=ns.device),
                     torch.zeros(B, S_l - valid_l, dtype=torch.bool, device=ns.device),
+                    torch.ones(B, valid_l, dtype=torch.bool, device=ns.device),
                 ],
                 dim=1,
             )
