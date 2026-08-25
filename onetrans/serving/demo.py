@@ -304,6 +304,56 @@ def test_routing_sharding() -> None:
     print("  分片 KV 门面： [ok] 同一 user 本地化命中，跨 shard 零复制")
 
 
+def test_dynamic_batching() -> None:
+    """动态 batching：攒批调度 + 批量 mget + score_ns_batch 数值等价单请求打分。"""
+    from onetrans.serving.pipeline import BatchScheduler, ScoreRequest
+
+    device = torch.device("cpu")
+    runner = _build_runner(seed=4)
+    store = build_kv_store(KVConfig(backend="local", dtype="float32"))
+    nearline = NearlineWorker(runner, store, metrics=ServingMetrics(), dtype="float32")
+    online = OnlineWorker(runner, store, metrics=ServingMetrics())
+
+    # 三个不同历史长度用户，各 1 候选
+    specs = [("u-b1", 17), ("u-b2", 33), ("u-b3", 45)]
+    s_embs, s_masks, kv_refs = [], [], []
+    for uid, valid in specs:
+        s, m = _make_sequence(1, valid, device)
+        nearline.ingest(s, m, user_id=uid, model_version="mv1")
+        s_embs.append(s)
+        s_masks.append(m)
+        kv_refs.append(runner.encode_s(s, m))
+
+    ns_refs = [torch.randn(1, NS_TOKENS, D_MODEL, device=device) for _ in specs]
+
+    # 1) 批量打分路径：一次 mget + 一次 score_ns_batch
+    batch = [
+        ScoreRequest(key=KVKey("mv1", uid), ns_emb=ns) for (uid, _), ns in zip(specs, ns_refs)
+    ]
+    got = online.score_batch(batch)  # [3, 2]
+
+    # 2) 参考：逐用户 score（单前向等价已由 test_equivalence 覆盖）
+    refs = []
+    for (s, m), kv, ns in zip(zip(s_embs, s_masks), kv_refs, ns_refs):
+        refs.append(runner.score_ns(kv, ns))  # [1, 2]
+    ref = torch.cat(refs, dim=0)
+    assert (got - ref).abs().max().item() < 1e-4, f"批量打分不等价 {(got - ref).abs().max()}"
+    print(f"动态 batching： [ok] {len(batch)} 用户攒批，score_ns_batch 与逐条一致")
+
+    # 3) 攒批调度器：满批/超时语义 + 线程安全
+    sched = BatchScheduler(max_batch_size=2, max_wait_seconds=0.01)
+    sched.submit(batch[0])
+    sched.submit(batch[1])
+    assert len(sched) == 2
+    first = sched.next_batch()
+    assert len(first) == 2  # 满批立即返回
+    # 不足满批时，超时后按已攒 ≥1 条返回
+    sched.submit(batch[2])
+    second = sched.next_batch()
+    assert len(second) == 1
+    print(f"  攒批调度器： [ok] 满批返回 {len(first)}，超时兜底返回 {len(second)}")
+
+
 def test_weight_loader() -> None:
     import tempfile
 
@@ -357,6 +407,7 @@ def main() -> None:
     test_pipeline()
     test_zero_copy()
     test_routing_sharding()
+    test_dynamic_batching()
     test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 

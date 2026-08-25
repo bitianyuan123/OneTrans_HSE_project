@@ -167,6 +167,61 @@ class TwoStageRunner:
             out = ns[:, -self.ns_tokens_num:, :].mean(dim=1)
         return self.linear(out)
 
+    # ------------------------------------------------------------------ #
+    # Stage II（批量）：B 个（user, 候选）对打包一次前向（动态 batching）
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def score_ns_batch(self, kvs: list[UserKV], ns_emb: Tensor) -> Tensor:
+        """批量交叉打分：把 ``B`` 个（用户，候选）对打包为单次前向。
+
+        实现前提（见设计文档 §4/§7）：pyramid 每层 K/V 宽度 ``S_l = dims[l]`` 对
+        所有用户恒定，可变的是 ``per_layer_len[l]``（有效 token 数）。故逐层把各用户
+        K/V 直接 ``stack``，有效掩码用「左 padding（有效靠后）」逐行构造，与
+        :meth:`score_ns` 数值等价（B=1 时逐位一致）。
+
+        :param kvs: ``B`` 个 :class:`UserKV`（同一用户多候选时重复传入）
+        :param ns_emb: ``[B, Ns, D]``
+        :return: logits ``[B, T]``
+        """
+        B = ns_emb.shape[0]
+        if B != len(kvs):
+            raise ValueError("kvs 数量须等于 ns_emb batch")
+        ns = ns_emb
+
+        for l, block in enumerate(self.blocks):
+            # 逐层 stack：各用户 K/V 宽度均为 dims[l]（fixed），故可直接打包
+            k_s = torch.stack([kv.per_layer[l][0][0] for kv in kvs], dim=0)  # [B, S_l, H, d]
+            v_s = torch.stack([kv.per_layer[l][1][0] for kv in kvs], dim=0)
+            S_l = k_s.shape[1]
+            valid = torch.tensor(
+                [kv.per_layer_len[l] for kv in kvs], dtype=torch.long, device=ns.device
+            )  # [B]
+            # 左 padding 掩码：每行后 valid 列为有效（与 score_ns 的 s_mask 构造等价）
+            s_mask = (
+                torch.arange(S_l, device=ns.device)[None, :] >= (S_l - valid)[:, None].to(ns.device)
+            )
+
+            h = block.norm(ns)
+            q_ns, k_ns, v_ns = _project_ns(block.mixed_attn, h)  # [B, Ns, H, d]
+
+            k = torch.cat([k_s, k_ns], dim=1)  # [B, S_l+Ns, H, d]
+            v = torch.cat([v_s, v_ns], dim=1)
+            attn = F.scaled_dot_product_attention(
+                q_ns.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                attn_mask=_cross_attn_mask(s_mask, ns.shape[1]), dropout_p=0.0,
+            )
+            attn = attn.transpose(1, 2).reshape(B, ns.shape[1], self.d_model)
+            attn = block.mixed_attn.final_proj(attn)
+            z = attn + ns
+            z = z + _apply_ns_ffn(block.mixed_ffn, block.norm(z), ns.shape[1])
+            ns = z
+
+        if self.use_cls_token:
+            out = ns[:, -1, :]
+        else:
+            out = ns[:, -self.ns_tokens_num:, :].mean(dim=1)
+        return self.linear(out)
+
 
 # --------------------------------------------------------------------------- #
 # 投影辅助（复用 mixed_attn / mixed_ffn 权重）

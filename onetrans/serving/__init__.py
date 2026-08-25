@@ -26,7 +26,7 @@ from onetrans.serving.kv_store import (
 )
 from onetrans.serving.meta_store import KVPointer, MetaStore, build_meta_store
 from onetrans.serving.metrics import ServingMetrics
-from onetrans.serving.pipeline import NearlineWorker, OnlineWorker
+from onetrans.serving.pipeline import BatchScheduler, NearlineWorker, OnlineWorker, ScoreRequest
 from onetrans.serving.router import JumpConsistentHash, RingHash, Router, hash64
 from onetrans.serving.sharded import ShardedKVStore, build_sharded_kv_store
 from onetrans.serving.two_stage import TwoStageRunner
@@ -35,6 +35,8 @@ __all__ = [
     "TwoStageRunner",
     "NearlineWorker",
     "OnlineWorker",
+    "BatchScheduler",
+    "ScoreRequest",
     "ServingMetrics",
     "KVKey",
     "KVConfig",

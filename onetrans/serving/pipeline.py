@@ -2,6 +2,7 @@
 
 - :class:`NearlineWorker`：Stage I，编码用户历史并写入 User KV（prefill）。
 - :class:`OnlineWorker`：Stage II，读 User KV 并对候选交叉打分（decode）。
+- :class:`BatchScheduler`：FIFO 攒批调度器，超时/满批触发批量打分（吞吐优先）。
 
 worker 只依赖 :class:`TwoStageRunner`、:class:`KVStore` 与 :class:`ServingMetrics`，
 与底层存储后端解耦（见 ``kv_store.py`` 的存储无关契约）。
@@ -12,7 +13,10 @@ worker 只依赖 :class:`TwoStageRunner`、:class:`KVStore` 与 :class:`ServingM
 
 from __future__ import annotations
 
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -107,6 +111,86 @@ class OnlineWorker:
         self.metrics.count("online.qps", 1.0)
         self.metrics.count("online.candidate_throughput", float(ns_emb.shape[0]))
         return logits
+
+    def score_batch(self, batch: list[ScoreRequest]) -> Tensor:
+        """批量打分：一次 ``mget`` + 一次 ``score_ns_batch`` 打包多个请求。
+
+        :param batch: 若干（user, 候选）打分请求（:class:`ScoreRequest`）
+        :return: logits ``[B, T]``（B 为所有候选总数，顺序与 batch 展平一致）
+        """
+        keys = [r.key for r in batch]
+        with self.metrics.timing("online.kv_mget"):
+            recs = self.store.mget(keys)
+        kvs: list[Any] = []
+        embs: list[Tensor] = []
+        for rec, req in zip(recs, batch):
+            if rec is None:
+                self.metrics.count("kv.miss", 1.0)
+                raise KeyError(f"user KV missing: {req.key}")
+            self.metrics.count("kv.hit", 1.0)
+            kv = decode_record(rec, req.ns_emb.device)
+            # 同用户多候选：kv 重复、候选展平
+            m = req.ns_emb.shape[0]
+            for _ in range(m):
+                kvs.append(kv)
+            embs.append(req.ns_emb)
+        ns_emb = torch.cat(embs, dim=0)  # [B, Ns, D]
+        with self.metrics.timing("online.encode_stage2"):
+            logits = self.runner.score_ns_batch(kvs, ns_emb)
+        self.metrics.count("online.qps", float(len(batch)))
+        self.metrics.count("online.candidate_throughput", float(ns_emb.shape[0]))
+        self.metrics.gauge("online.batch_size", float(ns_emb.shape[0]))
+        return logits
+
+
+@dataclass
+class ScoreRequest:
+    """一次打分请求（一个 user 的 M 个候选）。"""
+
+    key: KVKey
+    ns_emb: Tensor  # [M, Ns, D]
+
+
+class BatchScheduler:
+    """FIFO 攒批调度器：满批或超时即吐出一个批次（动态 batching / 吞吐优先）。
+
+    线程安全：生产者 :meth:`submit` 入队，消费者 :meth:`next_batch` 阻塞攒批。
+    攒批窗口 ``max_wait_seconds`` 内若未满批，也按「已攒到的 ≥1 条」返回，
+    保证时延有界。
+    """
+
+    def __init__(self, max_batch_size: int = 64, max_wait_seconds: float = 0.005) -> None:
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size 必须 ≥ 1")
+        self.max_batch_size = max_batch_size
+        self.max_wait_seconds = max_wait_seconds
+        self._queue: deque[ScoreRequest] = deque()
+        self._cond = threading.Condition()
+
+    def submit(self, req: ScoreRequest) -> None:
+        with self._cond:
+            self._queue.append(req)
+            self._cond.notify()
+
+    def next_batch(self) -> list[ScoreRequest]:
+        """阻塞取出一个批次（≥1 条，满批或超时返回）。"""
+        with self._cond:
+            while not self._queue:
+                self._cond.wait()
+            deadline = time.monotonic() + self.max_wait_seconds
+            while len(self._queue) < self.max_batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            batch: list[ScoreRequest] = []
+            while self._queue and len(batch) < self.max_batch_size:
+                batch.append(self._queue.popleft())
+            return batch
+
+    def __len__(self) -> int:
+        with self._cond:
+            return len(self._queue)
 
 
 def decode_record(rec: UserKVRecord, device: torch.device) -> Any:
