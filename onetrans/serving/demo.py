@@ -354,6 +354,72 @@ def test_dynamic_batching() -> None:
     print(f"  攒批调度器： [ok] 满批返回 {len(first)}，超时兜底返回 {len(second)}")
 
 
+def test_dispatcher() -> None:
+    """计算面线程模型：Dispatcher + WorkerPool + req_seq 异步匹配 + 背压。"""
+    import threading
+    import time
+
+    from onetrans.serving.dispatcher import Dispatcher, OverloadRejected, WorkerPool
+
+    # 模拟「计算耗时随 payload 变化」→ 乱序完成
+    def handler(req):
+        time.sleep(req.payload)
+        return req.req_seq  # 回显 req_seq，验证异步匹配到正确调用方
+
+    pool = WorkerPool(num_workers=3, queue_capacity=64, handler=handler)
+    disp = Dispatcher(pool, mode="hash", backpressure_timeout=None)
+    pool.start()
+
+    # 1) 并发提交：结果按 req_seq 一一对应（乱序完成下仍正确匹配）
+    n = 30
+    delays = [(i * 37) % 7 for i in range(n)]  # 0..6ms 伪随机
+    futs = []
+    barrier = threading.Barrier(3)
+
+    def producer(seed):
+        barrier.wait()
+        for i in range(seed, n, 3):
+            futs.append((i, disp.submit(user_id=f"user-{i}", payload=delays[i] / 1000.0)))
+
+    threads = [threading.Thread(target=producer, args=(s,)) for s in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(futs) == n
+    resp_pairs = [(f"user-{i}", fut.result(timeout=5.0)) for i, fut in futs]
+    # 每个响应回显的 user_id 必须与提交一致（证明 Future 无串扰，乱序完成仍正确匹配）
+    for uid, resp in resp_pairs:
+        assert resp.user_id == uid, f"异步匹配错乱：期望 {uid} 拿到 {resp.user_id}"
+    # req_seq 全局唯一且完整覆盖 1..n（证明 req_seq 分配/回收无重复）
+    seqs = sorted(resp.req_seq for _, resp in resp_pairs)
+    assert seqs == list(range(1, n + 1)), "req_seq 应唯一覆盖 1..n"
+    print(f"计算面线程模型： [ok] {n} 请求并发完成，req_seq 异步匹配一致")
+
+    # 2) 数据本地化：同一 user_id 恒落同一 worker
+    w0 = pool.worker_for("user-locality")
+    assert w0 == pool.worker_for("user-locality")
+    print(f"  数据本地化： [ok] 同 user 稳定映射 worker={w0}")
+
+    # 3) 背压：容量 2 的单队列不启动 worker（不被消费），提交超限即被拒绝
+    disp2 = Dispatcher(
+        WorkerPool(num_workers=1, queue_capacity=2, handler=handler),
+        mode="hash", backpressure_timeout=None,
+    )
+    futs2 = [disp2.submit(user_id=f"u{i}", payload=0.0) for i in range(5)]
+    rejected = sum(
+        1 for f in futs2
+        if f.done() and isinstance(f.exception(), OverloadRejected)
+    )
+    pending = sum(1 for f in futs2 if not f.done())
+    assert pending == 2 and rejected == 3, f"背压语义不符 pending={pending} rejected={rejected}"
+    print(f"  背压： [ok] 队列容量=2 → 缓存 {pending} 条，拒绝 {rejected} 条")
+
+    pool.stop()
+    disp2.close()
+
+
 def test_weight_loader() -> None:
     import tempfile
 
@@ -408,6 +474,7 @@ def main() -> None:
     test_zero_copy()
     test_routing_sharding()
     test_dynamic_batching()
+    test_dispatcher()
     test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 

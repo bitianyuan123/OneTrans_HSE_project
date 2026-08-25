@@ -11,8 +11,10 @@
 - ``router``           一致性哈希路由（user → owner shard）
 - ``meta_store``       元数据/版本面（KVPointer + TTL/LRU 失效）
 - ``sharded``          一致性哈希分片 KVStore（数据本地化）
+- ``dispatcher``       计算面线程模型（Dispatcher + WorkerPool + 背压）
 """
 
+from onetrans.serving.dispatcher import Dispatcher, OverloadRejected, Request, Response, WorkerPool
 from onetrans.serving.kv_store import (
     AppendResult,
     DeleteResult,
@@ -56,4 +58,9 @@ __all__ = [
     "hash64",
     "ShardedKVStore",
     "build_sharded_kv_store",
+    "Dispatcher",
+    "WorkerPool",
+    "Request",
+    "Response",
+    "OverloadRejected",
 ]
