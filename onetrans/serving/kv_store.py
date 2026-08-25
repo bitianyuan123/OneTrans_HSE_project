@@ -9,11 +9,17 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import torch
+
+
+def _urlsafe_b64(s: str) -> str:
+    """url-safe base64（去 ``=`` 填充），用于 datasystem key 字符集受限场景（§1.6）。"""
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 # --------------------------------------------------------------------------- #

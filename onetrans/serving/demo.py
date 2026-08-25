@@ -226,6 +226,84 @@ def test_zero_copy() -> None:
     print("KV 零拷贝： [ok] frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致")
 
 
+def test_routing_sharding() -> None:
+    """一致性哈希路由 + 元数据失效 + 分片 KV 门面（数据本地化）。"""
+    import time
+
+    from onetrans.serving.kv_store import UserKVRecord
+    from onetrans.serving.meta_store import KVPointer, LocalMetaStore, validate_pointer
+    from onetrans.serving.router import JumpConsistentHash, RingHash, Router, hash64
+    from onetrans.serving.sharded import ShardedKVStore
+
+    device = torch.device("cpu")
+    H, d = N_HEADS, D_MODEL // N_HEADS
+
+    # 1) jump 一致性哈希：同一 key 稳定路由，桶数变化时 remap 比例受控
+    jump = JumpConsistentHash(8)
+    owners = [jump.shard_of(f"user-{i}") for i in range(1000)]
+    assert all(0 <= o < 8 for o in owners)
+    # 扩缩容到 9 桶：remap 应接近 1/9（理论下界），远小于全量迁移
+    jump9 = JumpConsistentHash(9)
+    owners9 = [jump9.shard_of(f"user-{i}") for i in range(1000)]
+    from onetrans.serving.router import remap_ratio
+    remap = remap_ratio(owners, owners9)
+    assert remap < 0.2, f"jump hash remap 过高 {remap:.3f}"
+    print(f"  一致性哈希(jump)： [ok] 8→9 桶 remap={remap:.3f}（<理论全量）")
+
+    # 2) 环 hash：动态增删节点
+    ring = RingHash(vnodes_per_node=32)
+    ring.add_node("node-a")
+    ring.add_node("node-b")
+    assert ring.shard_of("user-x") in {"node-a", "node-b"}
+    ring.remove_node("node-a")
+    assert ring.shard_of("user-x") == "node-b"
+    print("  一致性哈希(ring)： [ok] add/remove node 路由稳定")
+
+    # 3) 稳定 hash：跨进程可复现（非 Python hash 随机盐）
+    assert hash64("user-42") == hash64("user-42")
+
+    # 4) 元数据指针校验：checksum 不一致触发降级判定
+    meta = LocalMetaStore()
+    ptr = KVPointer(
+        model_version="mv1", user_id="u1", checksum="deadbeef",
+        s_len=10, per_layer_len=[10], seq_ts_last=int(time.time()),
+    )
+    meta.set(ptr)
+    assert meta.get("mv1", "u1") is not None
+    good = UserKVRecord(
+        key=KVKey("mv1", "u1"), s_len=10, per_layer_len=[10],
+        dtype="float32", payload=b"abc",
+    )
+    assert validate_pointer(good, ptr) is False  # checksum 不匹配
+    ptr2 = KVPointer(model_version="mv1", user_id="u1", checksum=good.checksum,
+                     s_len=10, per_layer_len=[10], seq_ts_last=int(time.time()))
+    assert validate_pointer(good, ptr2) is True
+    meta.ttl("mv1", "u1", ttl_seconds=-1)  # 立即过期
+    assert meta.get("mv1", "u1") is None  # 惰性过期
+    print("  元数据失效： [ok] pointer 校验 + TTL 惰性过期")
+
+    # 5) 分片 KV 门面：同一 user 恒落到同一 shard（数据本地化）
+    shards = [
+        build_kv_store(KVConfig(backend="local", dtype="float32"))
+        for _ in range(3)
+    ]
+    sharded = ShardedKVStore(shards, router=Router(num_shards=3))
+    uid = "user-shard"
+    key = KVKey(model_version="mv1", user_id=uid)
+    rec = UserKVRecord(
+        key=key, s_len=10, per_layer_len=[10], dtype="float32",
+        payload=serialize([(torch.randn(1, 10, H, d), torch.randn(1, 10, H, d))]),
+    )
+    sharded.put(rec)
+    s0 = sharded.shard_of(uid)
+    assert s0 == sharded.router.route(uid)  # 稳定
+    got = sharded.get(key)
+    assert got is not None and got.checksum == rec.checksum
+    assert sharded.stores[s0].size() == 1  # 落在单一 shard，其余为空
+    assert sum(s.size() for s in sharded.stores) == 1
+    print("  分片 KV 门面： [ok] 同一 user 本地化命中，跨 shard 零复制")
+
+
 def test_weight_loader() -> None:
     import tempfile
 
@@ -278,6 +356,7 @@ def main() -> None:
     test_append_conflict(lambda: build_kv_store(KVConfig(backend="local")))
     test_pipeline()
     test_zero_copy()
+    test_routing_sharding()
     test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 

@@ -8,6 +8,9 @@
 - ``two_stage``        两阶段推理引擎（encode_s / score_ns）
 - ``metrics``          指标采集
 - ``pipeline``         Nearline/Online 编排
+- ``router``           一致性哈希路由（user → owner shard）
+- ``meta_store``       元数据/版本面（KVPointer + TTL/LRU 失效）
+- ``sharded``          一致性哈希分片 KVStore（数据本地化）
 """
 
 from onetrans.serving.kv_store import (
@@ -21,8 +24,11 @@ from onetrans.serving.kv_store import (
     UserKVRecord,
     build_kv_store,
 )
+from onetrans.serving.meta_store import KVPointer, MetaStore, build_meta_store
 from onetrans.serving.metrics import ServingMetrics
 from onetrans.serving.pipeline import NearlineWorker, OnlineWorker
+from onetrans.serving.router import JumpConsistentHash, RingHash, Router, hash64
+from onetrans.serving.sharded import ShardedKVStore, build_sharded_kv_store
 from onetrans.serving.two_stage import TwoStageRunner
 
 __all__ = [
@@ -39,4 +45,13 @@ __all__ = [
     "AppendResult",
     "DeleteResult",
     "build_kv_store",
+    "KVPointer",
+    "MetaStore",
+    "build_meta_store",
+    "JumpConsistentHash",
+    "RingHash",
+    "Router",
+    "hash64",
+    "ShardedKVStore",
+    "build_sharded_kv_store",
 ]
