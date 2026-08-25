@@ -1,0 +1,41 @@
+// 稀疏参数服务器（PS）数据面契约（fabric ①）。
+//
+// 独立 PS 服务承载大规模稀疏 embedding 表，供 Nearline（S 特征）与 Online（NS 特征）
+// 共享查表，避免每个精排服务实例各自维护一份稀疏表（内存/存储浪费）。
+//
+// 与 UserKV（fabric ②，datasystem）与元数据（fabric ③，Redis Cluster）分离。
+// 协议字段与 Python 侧 EmbeddingPSClient 的 wire 契约对齐。
+
+syntax = "proto3";
+
+package onetrans.ps;
+
+// 单次查表：给定表名（含模型版本）与稀疏特征 ID 列表。
+message EmbeddingLookupRequest {
+  string table = 1;          // 表名/模型版本，如 "onetrans@2026-08-25"
+  repeated int64 ids = 2;    // 稀疏特征 ID（去重后最多 N 个）
+}
+
+// 查表响应：逐 id 展平的向量 weights = [ids.size() * dim]。
+message EmbeddingLookupResponse {
+  string table = 1;
+  int32 dim = 2;             // 每 id 向量维度
+  repeated int64 ids = 3;    // 回显 id（与请求对齐）
+  repeated float weights = 4;  // 展平 [ids.size() * dim]，miss 填 0（seed 兜底在上层）
+  int64 version = 5;         // 表权重版本（权重版本化加载 / 失效校验）
+  int32 shard_id = 6;        // 命中分片（调试/指标，可忽略）
+}
+
+// 批量：客户端攒批推送多个子请求，服务端按分片并行 gather（动态 batching）。
+message EmbeddingBatchRequest {
+  repeated EmbeddingLookupRequest requests = 1;
+}
+
+message EmbeddingBatchResponse {
+  repeated EmbeddingLookupResponse responses = 1;
+}
+
+service EmbeddingService {
+  rpc Lookup(EmbeddingLookupRequest) returns (EmbeddingLookupResponse);
+  rpc BatchLookup(EmbeddingBatchRequest) returns (EmbeddingBatchResponse);
+}

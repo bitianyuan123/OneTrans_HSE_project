@@ -420,6 +420,40 @@ def test_dispatcher() -> None:
     disp2.close()
 
 
+def test_embedding_ps() -> None:
+    """独立 PS 数据面：分片表 + 客户端 lookup + miss seed 兜底 + 权重版本。"""
+    from onetrans.serving.embedding_ps_client import EmbeddingPSClient, LocalEmbeddingPS
+
+    dim = 16
+    ps = LocalEmbeddingPS(num_shards=8, dim=dim, seed=0)
+    ids = torch.tensor([10, 21, 32], dtype=torch.long)
+    weights = torch.randn(3, dim)
+    ps.set_many(table="mv1", ids=ids, weights=weights)
+    v1 = ps.version("mv1")
+    assert v1 == 3  # 每个 id 写入触发一次版本递增
+
+    # 绑定到已写入的同一本地 PS：验证「写侧表 → 客户端读侧」命中一致
+    client = EmbeddingPSClient("mv1", dim=dim, local=ps)
+    # 命中 + 未命中混查
+    query = torch.tensor([10, 999, 21], dtype=torch.long)
+    got = client.lookup(query)
+    assert got.shape == (3, dim)
+    # 命中 id 与写入一致；未命中 id 用 seed 兜底（确定性）
+    assert (got[0] - weights[0]).abs().max().item() < 1e-6
+    assert (got[2] - weights[1]).abs().max().item() < 1e-6
+    # 同一 miss id 两次查应一致（确定性的 seed 兜底）
+    again = client.lookup(torch.tensor([999], dtype=torch.long))
+    assert (got[1] - again[0]).abs().max().item() < 1e-6
+    assert got[1].abs().sum().item() > 0  # 兜底非全零
+    print(f"独立 PS 数据面： [ok] 分片查表命中/seed 兜底确定性，版本={v1}")
+
+    # 分片稳定性：同 feat_id 恒落同一分片
+    from onetrans.serving.embedding_ps_client import ShardedEmbeddingTable
+    tbl = ShardedEmbeddingTable(num_shards=8, dim=dim)
+    assert tbl.shard_of(1234) == tbl.shard_of(1234)
+    print(f"  分片稳定性： [ok] 同 id 稳定映射分片={tbl.shard_of(1234)}")
+
+
 def test_weight_loader() -> None:
     import tempfile
 
@@ -475,6 +509,7 @@ def main() -> None:
     test_routing_sharding()
     test_dynamic_batching()
     test_dispatcher()
+    test_embedding_ps()
     test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 

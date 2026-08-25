@@ -12,9 +12,15 @@
 - ``meta_store``       元数据/版本面（KVPointer + TTL/LRU 失效）
 - ``sharded``          一致性哈希分片 KVStore（数据本地化）
 - ``dispatcher``       计算面线程模型（Dispatcher + WorkerPool + 背压）
+- ``embedding_ps_client`` 独立稀疏参数服务器（PS）数据面客户端
 """
 
 from onetrans.serving.dispatcher import Dispatcher, OverloadRejected, Request, Response, WorkerPool
+from onetrans.serving.embedding_ps_client import (
+    EmbeddingPSClient,
+    LocalEmbeddingPS,
+    ShardedEmbeddingTable,
+)
 from onetrans.serving.kv_store import (
     AppendResult,
     DeleteResult,
@@ -63,4 +69,7 @@ __all__ = [
     "Request",
     "Response",
     "OverloadRejected",
+    "EmbeddingPSClient",
+    "LocalEmbeddingPS",
+    "ShardedEmbeddingTable",
 ]
