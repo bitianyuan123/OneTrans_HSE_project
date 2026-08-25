@@ -184,12 +184,58 @@ def test_tokenizer_split() -> None:
     print(f"tokenizer 拆分： [ok] encode_s {tuple(s_tokens.shape)} / encode_ns {tuple(ns_tokens.shape)} 与 forward 一致")
 
 
+def test_weight_loader() -> None:
+    import tempfile
+
+    from onetrans.serving.weight_loader import load_backbone, save_checkpoint
+
+    build_kwargs = dict(
+        d_model=D_MODEL,
+        num_blocks=N_BLOCKS,
+        num_heads=N_HEADS,
+        max_seq_len=MAX_SEQ_LEN,
+        min_seq_len=MIN_SEQ_LEN,
+        ns_tokens_num=NS_TOKENS,
+        dropout=0.0,
+    )
+
+    with tempfile.TemporaryDirectory() as ckpt_dir:
+        # 1) checkpoint 命中：保存 seed=7 权重 → 加载应逐位一致，source=checkpoint
+        torch.manual_seed(7)
+        ref = OneTrans(**build_kwargs).eval()
+        save_checkpoint(ref, f"{ckpt_dir}/mv1.pt", model_version="mv1", seed=7)
+
+        torch.manual_seed(1234)  # 干扰：加载前重置 RNG，证明权重来自 checkpoint 而非扰动
+        loaded, src = load_backbone("mv1", checkpoint_dir=ckpt_dir, seed=1234, **build_kwargs)
+        assert src == "checkpoint"
+        for (n1, p1), (n2, p2) in zip(ref.named_parameters(), loaded.named_parameters()):
+            assert n1 == n2 and (p1 - p2).abs().max().item() < 1e-7
+
+        # 2) checkpoint 缺失 → seed 兜底，且与显式 seed 构建一致
+        torch.manual_seed(42)
+        expected = OneTrans(**build_kwargs).eval()
+        torch.manual_seed(42)
+        loaded2, src2 = load_backbone("mv_missing", checkpoint_dir=ckpt_dir, seed=42, **build_kwargs)
+        assert src2 == "seed"
+        for p1, p2 in zip(expected.parameters(), loaded2.parameters()):
+            assert (p1 - p2).abs().max().item() < 1e-7
+
+        # 3) checkpoint 损坏/结构不匹配 → seed 兜底（不抛异常）
+        with open(f"{ckpt_dir}/bad.pt", "wb") as f:
+            f.write(b"\x00\x01 not a torch checkpoint")
+        loaded3, src3 = load_backbone("bad", checkpoint_dir=ckpt_dir, seed=0, **build_kwargs)
+        assert src3 == "seed"
+
+    print(f"权重版本化加载： [ok] checkpoint 命中一致 / 缺失与损坏均 seed 兜底")
+
+
 def main() -> None:
     test_equivalence()
     test_serialize_roundtrip()
     test_tokenizer_split()
     test_append_conflict(lambda: build_kv_store(KVConfig(backend="local")))
     test_pipeline()
+    test_weight_loader()
     print("\n全部端到端校验通过 ✅")
 
 

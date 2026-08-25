@@ -6,6 +6,29 @@ from onetrans.utils.transforms import ToDevice
 from onetrans.utils.metrics import uauc, compute_pairwise_accuracy
 
 
+def save_training_checkpoint(embedder, tokenizer, backbone, path, model_version=None, seed=None):
+    """保存全模型 checkpoint（embedder/tokenizer/backbone 的 state_dict + 轻量 meta）。
+
+    serving 侧经 ``onetrans.serving.weight_loader`` 按 ``model_version`` 加载 backbone，
+    本函数是 checkpoint 的生产端（训练循环里 epoch 结束后落盘）。
+    """
+    torch.save({
+        "embedder": embedder.state_dict(),
+        "tokenizer": tokenizer.state_dict(),
+        "backbone": backbone.state_dict(),
+        "meta": {"model_version": model_version, "seed": seed},
+    }, path)
+
+
+def load_training_checkpoint(embedder, tokenizer, backbone, path):
+    """加载全模型 checkpoint，返回 meta（失败抛异常由调用方兜底重训/seed 重建）。"""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    embedder.load_state_dict(ckpt["embedder"])
+    tokenizer.load_state_dict(ckpt["tokenizer"])
+    backbone.load_state_dict(ckpt["backbone"])
+    return ckpt.get("meta", {})
+
+
 def _forward(embedder, tokenizer, backbone, batch):
     embedded = embedder(batch)
     tokens, mask = tokenizer(embedded)
