@@ -1,6 +1,6 @@
 # 实现 & 现状总结
 
-> 版本：v0.2（二次修订）
+> 版本：v0.3（三次修订）
 > 分支：`feat/onetrans-e2e-serving`
 > 对应用户诉求：梳理「工程级详细设计」与「实现 & 现状」两份文档，评估与工程级推荐系统精排的差距。
 
@@ -69,6 +69,7 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 | **P1** | datasystem 后端**丢失有效长度元数据**：payload 只序列化 dtype+shape，`YuanrongKVStore.put` 只写 `payload`、`get` 用全宽 shape 重建 `s_len`/`per_layer_len`，左 padding（用户历史短于 max_seq_len）时注意力有效掩码错误 | `serialize.py`（header 无 `s_len`/`per_layer_len`）、`datasystem_adapter.py` L56-77/L99-107 | `serialize` header 纳入 `s_len`+`per_layer_len`，或 datasystem `get` 从 `KVPointer` 取回并校验 checksum |
 | **P1** | **PS 跨语言分片哈希不等价**：Python `hash64(str(id))`（sha256）≠ C++ `(id*Knuth)%n`；`embedding_server.cc` 注释误称「同构」 | `embedding_ps_client.py` L40-41 vs `embedding_server.cc` L33-37 | 统一到 C++ Knuth 乘法哈希（Python 改 `shard_of`），并对负 id 语义对齐 |
 | **P1** | **C++ PS 仅单表**：忽略 `req.table()`，无法多模型版本/灰度 | `embedding_server.cc` L131（单 `ShardedEmbeddingTable`）、L105-120 | server 侧 `table→ShardedEmbeddingTable` 映射 + 版本 |
+| **P1** | **路由哈希方案不统一（三次审阅新增）**：KV 分片用 jump 哈希（`Router`→`JumpConsistentHash`），worker 分派用 `hash64 % num_workers`（取模），同一 user 映射到不同 shard/worker，破坏「KV 与 owner worker 同节点共存」的数据本地性；且取模法扩缩容全量 remap | `sharded.py` L35-42（jump）vs `dispatcher.py` L106-107（`worker_for` 取模） | worker 分派与 KV 分片统一复用同一 `Router`（同一 `hash64` + 跳变哈希） |
 
 > 说明：本地后端（`LocalKVStore`）因「record 对象内联 `s_len`/`per_layer_len`」而正确，这属于**隐性依赖**，未固化到序列化契约——一旦切 datasystem 后端即触发 5.1 第一项回归，是「先单卡跑通、再切 datasystem」路径上的**最大的隐藏正确性风险**。
 
@@ -94,6 +95,17 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 - **无测试框架/CI**：`demo.py` 单脚本 `assert`，无 pytest/coverage/CI，回归保障弱。
 - **局部性能**：`_project_ns`/`_apply_ns_ffn` 逐 token Python 循环（Ns=8 可容忍）；`RingHash` 建环 O(vnodes·n²)；percentile 全样本排序。
 - **未接入项**：PS remote 数据面（Python→brpc）、redis 后端、datasystem HBM 直通、vLLM 自定义 op 移植。
+
+### 5.5 集成 / 落地缺口（P1，三次审阅新增）
+
+对照「工程级精排」的**端到端可运行性**，除 §5.1~§5.4 外仍有**尚未接线的链路**，属「单卡参照已通、集群落地未通」：
+
+| 级别 | 缺口 | 证据 | 建议 |
+|---|---|---|---|
+| **P1** | 无 C++ Nearline/Online 热路径 worker：两阶段 brpc 分离部署目前仅 PS（`deploy/ps`）有 C++ 参考实现，混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/attention/mixed_attention.py`、`nn/ffn/mixed_ffn.py` | 以 Python 参照为数值基准，移植 Stage I/II 到 brpc+bthread worker + vLLM 自定义层 |
+| **P1** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径：`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`，行为流→查表→编码、特征服务→查表→打分未接线 | `pipeline.py`（`NearlineWorker.ingest` / `OnlineWorker.score` 签名收 `s_emb`/`ns_emb`） | 接通 `OneTransTokenizer` + `EmbeddingPSClient`（fabric ①）到 pipeline 入口 |
+| **P1** | KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」或「空 KV 兜底快速返回」 | `pipeline.py` L103-105 / L127-130 | 增加降级路径（设计 §8 已提，代码未实现） |
+| **P1** | 无服务发现 / 模型版本注册中心：PS/datasystem 的 host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | `embedding_ps_client.py`（默认 127.0.0.1:8000）、`datasystem_adapter.py`（默认 127.0.0.1:31501） | 引入轻量服务发现 + 模型注册 + 配置/灰度开关 |
 
 ---
 

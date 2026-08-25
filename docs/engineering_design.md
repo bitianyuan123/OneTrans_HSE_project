@@ -1,6 +1,6 @@
 # 序列 Transformer 精排系统 · 工程级详细设计
 
-> 版本：v0.2（二次修订）
+> 版本：v0.3（三次修订）
 > 上游：[端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6）、[详细设计](./detailed_design.md)（KV/Tensor/指标契约）
 > 本文承接前两份文档，聚焦**工程侧**的高并发、分布式落地方案：线程模型、独立参数服务器、两阶段 brpc 分离部署、KV 零拷贝数据面、一致性哈希路由/元数据失效、动态 batching、可靠性、可观测性。
 
@@ -150,6 +150,13 @@
 | `serving/router.py` | `JumpConsistentHash`（最小 remap）+ `RingHash`（虚拟节点，动态增删）+ `Router` 门面 |
 | `serving/sharded.py` | `ShardedKVStore`：按 `user_id` 路由，`mget`/`delete`/`prefetch` 按 shard 聚合 |
 
+> **路由哈希不统一（P1，一致性，三次审阅新增）**：数据本地性的前提是「KV owner shard」与「处理 worker」对同一 `user_id` 落到同一物理节点。当前三处路由用**三种不同算法，彼此不等价**：
+> - `ShardedKVStore` 用 jump 哈希（`Router(num_shards)` → `JumpConsistentHash.shard_of`）；
+> - `WorkerPool.worker_for` 用 `hash64(key) % num_workers`（取模，`dispatcher.py` L106-107）；
+> - `ShardedEmbeddingTable.shard_of` 用 `hash64(str(feat_id)) % num_shards`（取模，且与 C++ Knuth 哈希不等价，见 §4.3）。
+>
+> 后果：即使 `num_shards == num_workers`，同一 user 的 KV 分片与 worker 也可能不一致，破坏「KV 与 worker 同节点共存」；且取模法在扩缩容时**全量 remap**（仅 jump 哈希最小化 remap）。**建议**：worker 分派与 KV 分片统一复用同一 `Router`（同一 `hash64` + 跳变哈希），PS 分片统一到 C++ Knuth 哈希。
+
 ### 6.2 元数据/版本失效
 
 | 文件 | 职责 |
@@ -241,8 +248,11 @@ deploy/ps/
 | **P1** | C++ PS 仅单表，忽略 `table` | `embedding_server.cc` | 无法多模型版本灰度 |
 | **P1（可靠性）** | 无超时/重试/熔断/健康检查/优雅停机 | `dispatcher.py`/客户端 | 生产稳定性 |
 | **P1（一致性）** | datasystem append 非原子（RMW + TOCTOU） | `datasystem_adapter.py` | 并发写脏数据风险 |
+| **P1（一致性）** | 路由哈希不统一（jump vs modulo vs Knuth），破坏 KV/worker 数据本地性 | `sharded.py`/`dispatcher.py`/`embedding_ps_client.py` | user 的 KV 与 worker 不共址、扩缩容全量 remap |
 | **P1（可观测）** | 指标仅内存，无导出/日志/追踪 | `metrics.py` | 无法线上观测 |
-| P1（验收） | PS remote 数据面 / vLLM op 移植 | `embedding_ps_client.py`/`nn/` | 尚不能端到端生产 |
+| **P1（落地）** | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考实现），混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/mixed_*` | 两阶段 brpc 分离部署仍为设计态 |
+| **P1（落地）** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径（`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`） | `pipeline.py` | 行为流→查表→编码、特征服务→查表→打分 未端到端接线 |
+| **P1（落地）** | KV miss 硬失败（`raise KeyError`）无降级；无服务发现/模型版本注册中心（host/port 硬编码） | `pipeline.py`、`embedding_ps_client.py`/`datasystem_adapter.py` | 不可灰度、不可容错 |
 | P2 | redis 后端、HBM 直通 | `kv_store.py`/`datasystem_adapter.py` | 环境依赖 |
 | P2 | 无测试框架/CI | 全局 | 回归保障弱（`demo.py` 单脚本 assert） |
 | P2 | `_project_ns`/`_apply_ns_ffn` 逐 token 循环、`RingHash` 建环 O(n²)、percentile 全样本 | `two_stage.py`/`router.py`/`metrics.py` | 局部性能（Ns 小，可容忍） |
