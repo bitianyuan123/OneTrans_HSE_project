@@ -75,6 +75,7 @@ class DeltaKV:
     offset: int  # 期望等于当前对象 s_len（乐观并发校验用）
     delta_len: int
     tensors: list[tuple[torch.Tensor, torch.Tensor]]  # per-layer (ΔK_s^l, ΔV_s^l)
+    expect_checksum: str = ""  # fencing token：非空时要求当前 payload checksum 匹配（见 gap_analysis G2）
 
 
 # --------------------------------------------------------------------------- #

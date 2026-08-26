@@ -24,7 +24,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from onetrans.serving.router import hash64
+from onetrans.serving.router import Router
 
 _STOP = object()
 
@@ -64,12 +64,16 @@ class WorkerPool:
         num_workers: int,
         queue_capacity: int,
         handler: Callable[[Request], Any],
+        router: Optional[Router] = None,
     ) -> None:
         if num_workers <= 0:
             raise ValueError("num_workers 必须 ≥ 1")
         if queue_capacity <= 0:
             raise ValueError("queue_capacity 必须 ≥ 1")
         self.num_workers = num_workers
+        # 统一复用 Router（jump 哈希）：worker 分派与 KV 分片对同一 user 落同一桶，
+        # 保证数据本地性（见 gap_analysis G3）；默认 num_shards == num_workers。
+        self.router = router or Router(num_shards=num_workers)
         self._queues: list[queue.Queue] = [
             queue.Queue(maxsize=queue_capacity) for _ in range(num_workers)
         ]
@@ -102,9 +106,9 @@ class WorkerPool:
         for t in self._workers:
             t.join()
 
-    # -- 路由：stable 哈希（跨进程可复现，与 KV 分片 locality 对齐） ---------- #
+    # -- 路由：复用 Router（jump 哈希），与 KV 分片 locality 对齐 ---------- #
     def worker_for(self, key: str) -> int:
-        return hash64(key) % self.num_workers
+        return self.router.route(key)
 
     # -- 入队：满队 → 背压（尝试或限时阻塞） -------------------------------- #
     def try_enqueue(self, worker_id: int, req: Request) -> bool:

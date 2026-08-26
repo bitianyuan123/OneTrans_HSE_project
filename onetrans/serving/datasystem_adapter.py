@@ -59,21 +59,25 @@ class YuanrongKVStore(KVStore):
         return PutResult(accepted=True, version=rec.key.model_version, checksum=rec.checksum)
 
     def get(self, key: KVKey, *, layers: list[int] | None = None) -> Optional[UserKVRecord]:
-        from onetrans.serving.serialize import deserialize  # 局部 import，避免 SDK 侧依赖
+        from onetrans.serving.serialize import deserialize_with_meta  # 局部 import，避免 SDK 侧依赖
 
         val = self._require().kv().get([str(key)])
         if not val or val[0] is None:
             return None
         payload: bytes = val[0]
-        per_layer = deserialize(payload)
+        per_layer, s_len, per_layer_len = deserialize_with_meta(payload)
         if layers is not None:
-            per_layer = [per_layer[l] for l in layers if l < len(per_layer)]
+            idx = [l for l in layers if 0 <= l < len(per_layer)]
+            per_layer = [per_layer[l] for l in idx]
+            per_layer_len = [per_layer_len[l] for l in idx]
+        if not per_layer:
+            return None
         return UserKVRecord(
             key=key,
-            s_len=per_layer[0][0].shape[1] if per_layer else 0,
-            per_layer_len=[k.shape[1] for k, _ in per_layer],
+            s_len=s_len,
+            per_layer_len=per_layer_len,
             dtype=self._dtype,
-            payload=_serialize_subset(per_layer),
+            payload=_serialize_subset(per_layer, s_len=s_len, per_layer_len=per_layer_len),
         )
 
     def mget(self, keys: list[KVKey], *, layers: list[int] | None = None) -> list[Optional[UserKVRecord]]:
@@ -87,21 +91,26 @@ class YuanrongKVStore(KVStore):
             return AppendResult(False, 0, "", reason="missing")
         if delta.offset != rec.s_len:
             return AppendResult(False, rec.s_len, "", reason="offset_conflict")
-        from onetrans.serving.serialize import deserialize
-
+        if delta.expect_checksum and delta.expect_checksum != rec.checksum:
+            # G2 CAS fencing：expect_checksum 不匹配即拒绝，消除读-合并-写 TOCTOU 丢写
+            return AppendResult(False, rec.s_len, "", reason="cas_conflict")
         import torch
+
+        from onetrans.serving.serialize import deserialize
 
         per_layer = deserialize(rec.payload)
         merged = [
             (torch.cat([p[0], d[0]], dim=1), torch.cat([p[1], d[1]], dim=1))
             for p, d in zip(per_layer, delta.tensors)
         ]
+        new_s_len = rec.s_len + delta.delta_len
+        new_per_layer_len = [pl + delta.delta_len for pl in rec.per_layer_len]
         new_rec = UserKVRecord(
             key=delta.key,
-            s_len=rec.s_len + delta.delta_len,
-            per_layer_len=[k.shape[1] for k, _ in merged],
+            s_len=new_s_len,
+            per_layer_len=new_per_layer_len,
             dtype=self._dtype,
-            payload=_serialize_subset(merged),
+            payload=_serialize_subset(merged, s_len=new_s_len, per_layer_len=new_per_layer_len),
             seq_ts_last=rec.seq_ts_last,
         )
         self._require().kv().set(str(delta.key), new_rec.payload)
@@ -121,7 +130,11 @@ class YuanrongKVStore(KVStore):
         raise NotImplementedError("异构对象 HBM 直通需昇腾 NPU 环境")
 
 
-def _serialize_subset(per_layer: list[tuple[Any, Any]]) -> bytes:
+def _serialize_subset(
+    per_layer: list[tuple[Any, Any]],
+    s_len: int | None = None,
+    per_layer_len: list[int] | None = None,
+) -> bytes:
     from onetrans.serving.serialize import serialize
 
-    return serialize(per_layer)
+    return serialize(per_layer, s_len=s_len, per_layer_len=per_layer_len)

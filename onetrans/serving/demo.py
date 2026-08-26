@@ -20,7 +20,7 @@ from onetrans.nn.tokenizer import NSGroupWiseTokenizer, OneTransTokenizer, SToke
 from onetrans.serving.kv_store import DeltaKV, KVConfig, KVKey, build_kv_store
 from onetrans.serving.metrics import ServingMetrics, report_table
 from onetrans.serving.pipeline import NearlineWorker, OnlineWorker
-from onetrans.serving.serialize import deserialize, serialize
+from onetrans.serving.serialize import deserialize, deserialize_with_meta, serialize
 from onetrans.serving.two_stage import TwoStageRunner
 
 # 与小配置对齐：d_model 可被 num_heads 整除
@@ -103,6 +103,12 @@ def test_serialize_roundtrip() -> None:
         assert (v1 - v2).abs().max().item() < 1e-6
     print(f"序列化 roundtrip： [ok] {len(payload)} bytes, {len(kv.per_layer)} 层逐层一致")
 
+    # G1：有效长度元数据（s_len/per_layer_len）随 header 固化，左 padding 不丢
+    payload_meta = serialize(kv.per_layer, s_len=kv.s_len, per_layer_len=kv.per_layer_len)
+    _, s_len, per_layer_len = deserialize_with_meta(payload_meta)
+    assert s_len == kv.s_len and per_layer_len == kv.per_layer_len
+    print(f"  有效长度元数据： [ok] s_len={s_len}, per_layer_len={per_layer_len} 随 header 固化")
+
 
 def test_append_conflict(build_kv_store_fn) -> None:
     import time
@@ -137,6 +143,14 @@ def test_append_conflict(build_kv_store_fn) -> None:
     # offset 冲突时 new_s_len 应回传当前 s_len（首个 append 成功后为 13）
     assert bad.new_s_len == 13
 
+    # G2：fencing token——expect_checksum 不匹配时以 cas_conflict 拒绝（不丢写）
+    cas = store.append(
+        DeltaKV(key=key, base_version="mv1", offset=13, delta_len=3,
+                tensors=[(dk, dv)], expect_checksum="stale-checksum")
+    )
+    assert cas.accepted is False and cas.reason == "cas_conflict"
+    print(f"  cas fencing： [ok] expect_checksum 不匹配拒绝 ({cas.reason})")
+
 
 def test_pipeline() -> None:
     device = torch.device("cpu")
@@ -158,6 +172,11 @@ def test_pipeline() -> None:
     ref = runner.score_ns(kv, ns_emb)
     assert (ref - got).abs().max().item() < 1e-4
     print(f"pipeline 读写链路： [ok] put->get 命中, 3 候选打分一致")
+
+    # G8：KV miss 降级——缺失用户返回全零且不抛异常
+    miss = online.score("no-such-user", mv, ns_emb)
+    assert miss.shape == got.shape and miss.abs().max().item() == 0.0
+    print(f"  KV miss 降级： [ok] 缺失用户返回全零且不抛异常 (shape={tuple(miss.shape)})")
 
     print(report_table(metrics.snapshot(), title="serving metrics"))
     return metrics
@@ -340,6 +359,19 @@ def test_dynamic_batching() -> None:
     assert (got - ref).abs().max().item() < 1e-4, f"批量打分不等价 {(got - ref).abs().max()}"
     print(f"动态 batching： [ok] {len(batch)} 用户攒批，score_ns_batch 与逐条一致")
 
+    # 1.5) G8 miss/hit 混查：缺失用户填全零行，顺序对齐，不抛异常
+    mix_batch = [
+        ScoreRequest(key=KVKey("mv1", "u-b1"), ns_emb=ns_refs[0]),
+        ScoreRequest(key=KVKey("mv1", "u-missing"), ns_emb=ns_refs[1]),
+        ScoreRequest(key=KVKey("mv1", "u-b3"), ns_emb=ns_refs[2]),
+    ]
+    mix_got = online.score_batch(mix_batch)  # [3, 2]
+    assert mix_got.shape == (3, 2)
+    assert mix_got[1].abs().max().item() == 0.0  # 缺失行全零
+    assert (mix_got[0] - runner.score_ns(kv_refs[0], ns_refs[0])).abs().max().item() < 1e-4
+    assert (mix_got[2] - runner.score_ns(kv_refs[2], ns_refs[2])).abs().max().item() < 1e-4
+    print(f"  miss/hit 混查： [ok] 缺失行全零、命中行与逐条一致")
+
     # 3) 攒批调度器：满批/超时语义 + 线程安全
     sched = BatchScheduler(max_batch_size=2, max_wait_seconds=0.01)
     sched.submit(batch[0])
@@ -401,6 +433,12 @@ def test_dispatcher() -> None:
     w0 = pool.worker_for("user-locality")
     assert w0 == pool.worker_for("user-locality")
     print(f"  数据本地化： [ok] 同 user 稳定映射 worker={w0}")
+
+    # 2.1) G3：worker 分派与 KV 分片复用同一 Router（jump 哈希），同 shard 数下同 user 落同桶
+    from onetrans.serving.router import Router
+    shard_router = Router(num_shards=3)
+    assert pool.worker_for("user-locality") == shard_router.route("user-locality")
+    print(f"  路由统一： [ok] worker_for == Router.route (jump 哈希)")
 
     # 3) 背压：容量 2 的单队列不启动 worker（不被消费），提交超限即被拒绝
     disp2 = Dispatcher(

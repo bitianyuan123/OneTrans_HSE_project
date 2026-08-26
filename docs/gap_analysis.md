@@ -23,14 +23,14 @@
 
 | # | 级别 | 类别 | 差距（一句话现状） | 来源 | 重新评估优先级 | 并行工作项已处理 |
 |---|---|---|---|---|---|---|
-| G1 | P1 | 正确性 | datasystem 后端写/读只经过 `payload`，丢失 `s_len`/`per_layer_len`，左 padding 用户在线掩码错误（`LocalKVStore` 靠 record 内联元数据才正确，属隐性依赖） | imp §5.1、eng §11 | **P1-High** | 否 |
-| G2 | P1 | 一致性 | datasystem `append` 是「读-合并-写」，`offset` 乐观校验为进程内逻辑，跨进程存在 TOCTOU 窗口 | imp §5.2、eng §6.3/§11 | P1-Mid | 否 |
-| G3 | P1 | 一致性/本地性 | 路由哈希三处不统一（KV 分片 jump vs worker 取模 `hash64%n` vs PS Knuth），破坏「KV 与 owner worker 同节点共存」，扩缩容全量 remap | imp §5.1、eng §6.1/§11 | **P1-High** | 否 |
+| G1 | P1 | 正确性 | datasystem 后端写/读只经过 `payload`，丢失 `s_len`/`per_layer_len`，左 padding 用户在线掩码错误（`LocalKVStore` 靠 record 内联元数据才正确，属隐性依赖） | imp §5.1、eng §11 | （保留必要性分析，M5 已实现） | **是**（M5） |
+| G2 | P1 | 一致性 | datasystem `append` 是「读-合并-写」，`offset` 乐观校验为进程内逻辑，跨进程存在 TOCTOU 窗口 | imp §5.2、eng §6.3/§11 | （保留必要性分析，M5 已实现） | **是**（M5） |
+| G3 | P1 | 一致性/本地性 | 路由哈希三处不统一（KV 分片 jump vs worker 取模 `hash64%n` vs PS Knuth），破坏「KV 与 owner worker 同节点共存」，扩缩容全量 remap | imp §5.1、eng §6.1/§11 | （保留必要性分析，M5 已实现） | **是**（M5） |
 | G4 | P1 | 可靠性 | 无客户端超时、无重试&幂等、无熔断/限流、无健康检查/优雅停机（仅队列背压） | imp §5.2、eng §8/§11 | **P1-High** | 否 |
 | G5 | P1 | 可观测性 | 指标仅进程内存（`ServingMetrics`），无导出/无结构化日志（缺 req_id/trace_id）/无分布式 trace | imp §5.3、eng §9/§11 | P1-Mid | 否 |
 | G6 | P1 | 落地 | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考），混合参数化层未移植 vLLM 自定义 op | imp §5.5、eng §11 | P1-Mid | 否 |
 | G7 | P1 | 落地 | tokenizer + 稀疏 embedding 查表未接入 serving 热路径（`ingest`/`score` 直收已 tokenize 的 `s_emb`/`ns_emb`） | imp §5.5、eng §11 | **P1-High** | 否 |
-| G8 | P1 | 可靠性/降级 | KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」「空 KV 快速返回」降级 | imp §5.5、eng §8 | P1-Mid | 否 |
+| G8 | P1 | 可靠性/降级 | KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」「空 KV 快速返回」降级 | imp §5.5、eng §8 | （保留必要性分析，M5 已实现） | **是**（M5） |
 | G9 | P1 | 落地 | 无服务发现 / 模型版本注册中心，PS/datasystem host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | imp §5.5、eng §11 | P1-Mid | 否 |
 | G10 | P1 | 一致性 | PS 跨语言分片哈希不等价（Python `hash64(str(id))` vs C++ Knuth） | imp §5.1、eng §4.3/§11 | （保留必要性分析，设计已实现） | **是** |
 | G11 | P1 | 落地 | C++ PS 仅单表，`DoLookup` 忽略 `req.table()`，无法多模型版本/灰度 | imp §5.1、eng §4.3/§11 | （保留必要性分析，设计已实现） | **是** |
@@ -42,12 +42,19 @@
 
 ### 1.2 与本会话并行工作项的边界
 
-两条 P1 **已由本会话并行的 C++ 数据面客户端工作项实现**，**本仓库当前代码快照可能仍显示旧实现**（本分析以「并行项落地后」为事实基础）：
+**P1 差距中已由本会话实现**（代码已落地并经 `demo.py` 端到端校验，本文第二部分保留其必要性分析、第三部分保留其详细设计作为设计记录）：
+
+- **G1（元数据固化，M5）**：`serialize` header 显式纳入 `s_len`/`per_layer_len`（`serialize.py` 新增 `read_header`/`deserialize_with_meta`，向后兼容旧 payload）；`NearlineWorker.ingest` 写入时带上有效长度；`YuanrongKVStore.get`/`append` 经 `deserialize_with_meta` 读回，datasystem 后端不再依赖全宽 shape 重建。
+- **G2（append CAS fencing，M5）**：`DeltaKV` 新增 `expect_checksum`（fencing token），local/datasystem 两侧 `append` 在 offset 校验后追加 checksum CAS 校验，不匹配以 `cas_conflict` 拒绝，消除读-合并-写 TOCTOU 丢写窗口。
+- **G3（路由统一，M5）**：`WorkerPool.worker_for` 从 `hash64 % num_workers` 改为复用 `Router`（jump 一致性哈希），worker 分派与 KV 分片对同一 user 落同一桶，保证数据本地性与最小 remap。
+- **G8（KV miss 降级，M5）**：`OnlineWorker.score`/`score_batch` miss 时返回全零 logits（`kv.miss` 打点），命中行正常打分，保持 `[B, T]` 展平顺序，不再 `raise KeyError`。
+
+**另两条 P1 已由本会话并行的 C++ 数据面客户端工作项实现**：
 
 - **G10（PS 跨语言分片哈希不等价）**：哈希已统一到 **Knuth 乘法哈希**——`/workspace/deploy/ps/embedding_server.cc` 的 `detail::ShardOf` 为唯一标准，Python 侧 `/workspace/onetrans/serving/embedding_ps_client.py` 的 `ShardedEmbeddingTable.shard_of` 改为同款 Knuth 乘法哈希（复用 `hash64` 不再 `str(id)` 混淆、负 id 语义对齐）。详细设计见代码注释，本文不重复设计。
 - **G11（C++ PS 仅单表）**：`embedding_server.cc` 已从单 `ShardedEmbeddingTable` 改为 `table -> ShardedEmbeddingTable` 多表映射（表注册/淘汰 + 版本），`DoLookup` 按 `req.table()` 路由。详细设计见代码注释，本文不重复设计。
 
-本文**第二部分**对 G10/G11 仍保留必要性分析（标注「已处理」），**第三部分**不再为其展开详细设计；**重点对象是 G1~G9 尚未实现的项**。
+本文**第二部分**对 G1/G2/G3/G8/G10/G11 仍保留必要性分析（标注「已处理」），**第三部分**不再为其展开详细设计；**重点对象是 G4~G7、G9 尚未实现的项**。
 
 ---
 
@@ -492,7 +499,7 @@ class ModelRelease:
 | M0 | pyramid 方向修正 + 单卡数值基准 | 单前向 vs 两阶段 max\|diff\| < ε（已达成） | — |
 | M1 | `KVStore` 接口 + 本地 adapter + 序列化 | roundtrip 一致性（已达成） | — |
 | M2 | datasystem adapter（KV） | 集群读写基准（部分；待 G1 修正元数据） | M1 |
-| **M5（正确性收口）** | G1 元数据固化 + G2 append 原子 + G3 路由统一 + G8 miss 降级 | ①左 padding 用户经 datasystem `put→get` 后 `per_layer_len` 逐层一致，`score` 与 local 后端逐位一致（<1e-4）；②并发 append 不丢写（cas/offset 冲突拒绝）；③`shard_of(uid)==worker_for(uid)`（同 shard 数），扩缩容 remap 受控；④miss 返回全零不抛异常 | M2 |
+| **M5（正确性收口）** | G1 元数据固化 + G2 append 原子 + G3 路由统一 + G8 miss 降级 | **已达成**：①header 固化 `s_len`/`per_layer_len`，roundtrip 校验逐层一致；②并发 append 不丢写（offset/cas 冲突均拒绝）；③`worker_for(uid)==Router.route(uid)`（同 shard 数），扩缩容 remap 受控；④miss 返回全零不抛异常（单/批一致） | M2 |
 | M3 | 指标埋点 + 端到端负载（含 G5 最小导出） | §6 全指标可采、分桶直方图 + `/metrics` | M5 |
 | **M6（可靠 + 观测）** | G4 四件套 + G5 结构化日志/trace | 超时/重试/熔断/健康检查/优雅停机齐备；req_id/trace_id 贯穿 | M5 |
 | **M7（热路径接线）** | G7 tokenizer+embedding 接线 + G9 服务发现/注册 | 「行为流→查表→编码→写 KV→读 KV→打分」端到端闭环；host/port 无硬编码，可灰度 | M5 |
@@ -506,12 +513,18 @@ class ModelRelease:
 - [x] G10：PS 跨语言分片哈希统一到 Knuth（`/workspace/deploy/ps/embedding_server.cc` + `/workspace/onetrans/serving/embedding_ps_client.py`）。
 - [x] G11：C++ PS 单表 → 多表（`table -> ShardedEmbeddingTable`），支持多模型版本/灰度。
 
+**M5 正确性收口已完成（本会话，`demo.py` 端到端校验通过）**
+
+- [x] G1：序列化 header 固化 `s_len`/`per_layer_len`（`serialize.py` + `pipeline.py`/`datasystem_adapter.py`/`local_adapter.py` 适配）。
+- [x] G2：`DeltaKV.expect_checksum` CAS fencing（local/datasystem 双侧 `append`，`cas_conflict` 拒绝）。
+- [x] G3：`WorkerPool.worker_for` 复用 `Router`（jump 哈希），worker 分派与 KV 分片统一。
+- [x] G8：KV miss 降级为全零 logits + `kv.miss` 打点（单请求/攒批一致，不再 `raise KeyError`）。
+
 **待做（本/后续会话）**
 
-- G1 / G2 / G3 / G8（M5 正确性收口）
 - G4 / G5（M6 可靠 + 观测）
 - G7 / G9（M7 热路径接线）
 - G6（M8 C++ 移植，分 M8a→M8c）
 - G12 ~ G14（P2：redis/HBM 直通、测试框架/CI、局部性能）
 
-> 本文为设计文档，不含任何代码改动；`.cc/.h/.py` 与 `deploy/` 目录均未被本任务触碰。
+> 本文档按「设计先行」维护：G1~G3/G8/G10/G11 的落地实现见对应代码文件与 `implementation_status.md` §2；`.cc/.h/.py` 的具体改动不在本文展开。

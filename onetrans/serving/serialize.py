@@ -37,11 +37,23 @@ def _nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
     return n * dtype.itemsize
 
 
-def serialize(per_layer: Sequence[tuple[Tensor, Tensor]]) -> bytes:
+def serialize(
+    per_layer: Sequence[tuple[Tensor, Tensor]],
+    s_len: int | None = None,
+    per_layer_len: Sequence[int] | None = None,
+) -> bytes:
     """把逐层 ``(K_s^l, V_s^l)`` 序列化为单个连续字节 blob。
 
     预分配总字节数，一次 memmove 拷贝每张量底层字节，避免重复分配。
+
+    ``s_len``/``per_layer_len`` 为**有效长度元数据**（左 padding 语义下 ``K_s`` 的
+    shape[1] 是 pyramid 该层满宽 ``dims[l]``，需显式区分有效 token 数，见
+    ``docs/gap_analysis.md`` G1）。不传时回退为满宽（兼容无 padding 场景与旧调用）。
     """
+    if per_layer_len is None:
+        per_layer_len = [k.shape[1] for k, _ in per_layer]
+    s_len = s_len if s_len is not None else (per_layer_len[0] if per_layer_len else 0)
+
     flat: list[Tensor] = []
     meta: list[tuple[int, str]] = []  # (element_size, dtype_str)
     for k, v in per_layer:
@@ -56,8 +68,9 @@ def serialize(per_layer: Sequence[tuple[Tensor, Tensor]]) -> bytes:
     header = {
         "dtype": meta[0][1] if meta else "float32",
         "n_layers": len(per_layer),
+        "s_len": s_len,
         "layers": [
-            {"l": i, "k_shape": list(k.shape), "v_shape": list(v.shape)}
+            {"l": i, "k_shape": list(k.shape), "v_shape": list(v.shape), "len": per_layer_len[i]}
             for i, (k, v) in enumerate(per_layer)
         ],
     }
@@ -85,12 +98,8 @@ def serialize(per_layer: Sequence[tuple[Tensor, Tensor]]) -> bytes:
     return bytes(buf)
 
 
-def deserialize(payload: bytes | bytearray | memoryview) -> list[tuple[Tensor, Tensor]]:
-    """把字节 blob 还原为逐层 ``(K_s^l, V_s^l)``（零拷贝视图）。
-
-    :param payload: 底层缓冲；``bytes`` 得到只读视图，``bytearray``/``memoryview``/``mmap``
-        得到可直接写回的视图（零拷贝）。返回张量与底层缓冲共享存储。
-    """
+def _parse_header(payload: bytes | bytearray | memoryview) -> tuple[dict, int]:
+    """解析并校验 ``<magic><header_len><header_json>``，返回 ``(header, 其后偏移)``。"""
     if bytes(payload[: len(_MAGIC)]) != _MAGIC:
         raise ValueError("未知 payload 魔数")
     pos = len(_MAGIC)
@@ -98,7 +107,43 @@ def deserialize(payload: bytes | bytearray | memoryview) -> list[tuple[Tensor, T
     pos += 4
     header = json.loads(bytes(payload[pos : pos + hlen]).decode("utf-8"))
     pos += hlen
+    return header, pos
 
+
+def read_header(payload: bytes | bytearray | memoryview) -> dict:
+    """仅解析 header，返回 ``dict``（含 ``s_len`` 与各层 ``layers[].len``）。
+
+    供读侧只需有效长度元数据、而不反序列化整对象张量的场景（如 datasystem
+    ``get``/``append``，见 ``docs/gap_analysis.md`` G1）。
+    """
+    header, _ = _parse_header(payload)
+    return header
+
+
+def deserialize_with_meta(
+    payload: bytes | bytearray | memoryview,
+) -> tuple[list[tuple[Tensor, Tensor]], int, list[int]]:
+    """反序列化并返回 ``(per_layer, s_len, per_layer_len)``。
+
+    有效长度来自 header（``s_len`` / ``layers[].len``）；旧数据（无这些字段）回退为
+    「满宽有效」，与旧语义一致（向后兼容，见 ``docs/gap_analysis.md`` G1）。
+    """
+    header, _ = _parse_header(payload)
+    per_layer = deserialize(payload)
+    s_len = header.get("s_len")
+    if s_len is None:
+        s_len = per_layer[0][0].shape[1] if per_layer else 0
+    per_layer_len = [m.get("len", m["k_shape"][1]) for m in header["layers"]]
+    return per_layer, s_len, per_layer_len
+
+
+def deserialize(payload: bytes | bytearray | memoryview) -> list[tuple[Tensor, Tensor]]:
+    """把字节 blob 还原为逐层 ``(K_s^l, V_s^l)``（零拷贝视图）。
+
+    :param payload: 底层缓冲；``bytes`` 得到只读视图，``bytearray``/``memoryview``/``mmap``
+        得到可直接写回的视图（零拷贝）。返回张量与底层缓冲共享存储。
+    """
+    header, pos = _parse_header(payload)
     dtype = getattr(torch, header["dtype"])
     out: list[tuple[Tensor, Tensor]] = []
     for meta in header["layers"]:
@@ -125,13 +170,7 @@ def _view_tensor(
 
 def per_layer_offsets(payload: bytes | bytearray | memoryview) -> list[tuple[int, int]]:
     """返回每层 ``(K 偏移, V 偏移)``（用于按层抽取而不反序列化整对象，见设计文档 §2.3）。"""
-    if bytes(payload[: len(_MAGIC)]) != _MAGIC:
-        raise ValueError("未知 payload 魔数")
-    pos = len(_MAGIC)
-    (hlen,) = struct.unpack_from(_HEADER_FMT, payload, pos)
-    pos += 4
-    header = json.loads(bytes(payload[pos : pos + hlen]).decode("utf-8"))
-    pos += hlen
+    header, pos = _parse_header(payload)
     dtype = getattr(torch, header["dtype"])
     offsets: list[tuple[int, int]] = []
     for meta in header["layers"]:

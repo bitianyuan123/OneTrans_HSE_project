@@ -1,6 +1,6 @@
 # 实现 & 现状总结
 
-> 版本：v0.3（三次修订）
+> 版本：v0.4（四次修订：M5 正确性收口完成）
 > 分支：`feat/onetrans-e2e-serving`
 > 对应用户诉求：梳理「工程级详细设计」与「实现 & 现状」两份文档，评估与工程级推荐系统精排的差距。
 
@@ -8,9 +8,9 @@
 
 ## 1. 现状总览（一页）
 
-序列 Transformer 精排（OneTrans 类）的**单机参照实现**已完成，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。
+序列 Transformer 精排（OneTrans 类）的**单机参照实现**已完成，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级，见 §5 各「已修复」条目）。
 
-生产侧（C++ brpc / datasystem / 稀疏 PS）以「接口契约 + 参考实现」形式给出：`deploy/ps/`（brpc 分片 PS）、`datasystem_adapter.py`（存储无关 adapter）、`engineering_design.md`（工程级方案）。**但距离工程级可用仍有明显差距**，主要集中在正确性细节、可靠性与可观测性（见 §5）。
+生产侧（C++ brpc / datasystem / 稀疏 PS）以「接口契约 + 参考实现」形式给出：`deploy/ps/`（brpc 分片 PS）、`datasystem_adapter.py`（存储无关 adapter）、`engineering_design.md`（工程级方案）。**剩余差距**集中在可靠性与可观测性（G4/G5）、热路径接线（G7/G9）、C++ 移植（G6），见 §5。
 
 ---
 
@@ -25,6 +25,7 @@
 | 5 | 动态 batching（攒批打分） | `pipeline.py`、`two_stage.py` | `ae2ccc6` | 攒批 vs 逐条等价 |
 | 6 | 计算面线程模型（P1） | `dispatcher.py` | `4ed2436` | 并发完成 / 本地化 / 背压 |
 | 7 | 独立稀疏参数服务器 PS | `deploy/ps/*`、`embedding_ps_client.py` | `68d4b98` | 命中/seed 兜底/版本 |
+| 8 | M5 正确性收口：G1 元数据固化 + G2 append CAS + G3 路由统一 + G8 miss 降级 | `serialize.py`、`kv_store.py`、`pipeline.py`、`local_adapter.py`、`datasystem_adapter.py`、`dispatcher.py` | （本次提交） | header 固化 roundtrip / cas_conflict 拒绝 / worker_for==Router.route / miss 全零 |
 
 ---
 
@@ -36,11 +37,17 @@
   valid_len=23 candidates=1  max|diff|=0.000e+00
   valid_len=37 candidates=5  max|diff|=6.706e-08
 KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
+  有效长度元数据： s_len=31, per_layer_len=[31, 31, 27, 16] 随 header 固化（G1）
+append 乐观并发： 正确 offset 接受 / offset_conflict 拒绝 / cas_conflict 拒绝（G2）
+  KV miss 降级： 缺失用户返回全零且不抛异常（G8）
 一致性哈希(jump)： 8→9 桶 remap=0.116（<理论全量）
 元数据失效： pointer 校验 + TTL 惰性过期
 动态 batching： 3 用户攒批，score_ns_batch 与逐条一致
+  miss/hit 混查： 缺失行全零、命中行与逐条一致（G8）
 计算面线程模型： 30 请求并发完成，req_seq 异步匹配一致；背压拒绝 3 条
+  路由统一： worker_for == Router.route（jump 哈希）（G3）
 独立 PS 数据面： 分片查表命中/seed 兜底确定性，版本=3
+  分片稳定性： 同 id 稳定映射分片=2（Knuth 跨语言等价）
 权重版本化加载： checkpoint 命中一致 / 缺失与损坏均 seed 兜底
 ```
 
@@ -55,6 +62,7 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 | P1 | 计算面线程模型（消全局锁 + req_seq 异步匹配 + 背压） | ✅ 已实现 | demo 并发/背压校验通过 |
 | P1 | 独立稀疏参数服务器（brpc 分片 + 版本化） | ✅ 已实现 | commit `68d4b98` |
 | P1 | PS 客户端绑定错误（client 读到空表） | ✅ 已修复 | `test_embedding_ps` 改为绑定已写入的 `ps` 实例 |
+| P1 | G1 datasystem 元数据丢失 / G2 append CAS / G3 路由统一 / G8 miss 降级（M5 正确性收口） | ✅ 已实现 | 见 §2 第 8 行；`demo.py` 全部断言通过 |
 
 ---
 
@@ -66,12 +74,12 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 
 | 级别 | 问题 | 证据（代码位置） | 建议 |
 |---|---|---|---|
-| **P1** | datasystem 后端**丢失有效长度元数据**：payload 只序列化 dtype+shape，`YuanrongKVStore.put` 只写 `payload`、`get` 用全宽 shape 重建 `s_len`/`per_layer_len`，左 padding（用户历史短于 max_seq_len）时注意力有效掩码错误 | `serialize.py`（header 无 `s_len`/`per_layer_len`）、`datasystem_adapter.py` L56-77/L99-107 | `serialize` header 纳入 `s_len`+`per_layer_len`，或 datasystem `get` 从 `KVPointer` 取回并校验 checksum |
-| **P1** | **PS 跨语言分片哈希不等价**：Python `hash64(str(id))`（sha256）≠ C++ `(id*Knuth)%n`；`embedding_server.cc` 注释误称「同构」 | `embedding_ps_client.py` L40-41 vs `embedding_server.cc` L33-37 | 统一到 C++ Knuth 乘法哈希（Python 改 `shard_of`），并对负 id 语义对齐 |
-| **P1** | **C++ PS 仅单表**：忽略 `req.table()`，无法多模型版本/灰度 | `embedding_server.cc` L131（单 `ShardedEmbeddingTable`）、L105-120 | server 侧 `table→ShardedEmbeddingTable` 映射 + 版本 |
-| **P1** | **路由哈希方案不统一（三次审阅新增）**：KV 分片用 jump 哈希（`Router`→`JumpConsistentHash`），worker 分派用 `hash64 % num_workers`（取模），同一 user 映射到不同 shard/worker，破坏「KV 与 owner worker 同节点共存」的数据本地性；且取模法扩缩容全量 remap | `sharded.py` L35-42（jump）vs `dispatcher.py` L106-107（`worker_for` 取模） | worker 分派与 KV 分片统一复用同一 `Router`（同一 `hash64` + 跳变哈希） |
+| **P1** | ~~datasystem 后端**丢失有效长度元数据**~~ | ✅ **M5 已修复**：`serialize` header 固化 `s_len`+`per_layer_len`（`serialize.py` `read_header`/`deserialize_with_meta`，向后兼容），`NearlineWorker.ingest` 写入、`YuanrongKVStore.get`/`append` 读回，datasystem 后端与 local 语义一致 |
+| **P1** | **PS 跨语言分片哈希不等价**：Python `hash64(str(id))`（sha256）≠ C++ `(id*Knuth)%n`；`embedding_server.cc` 注释误称「同构」 | ✅ **已修复**：统一到 C++ Knuth 乘法哈希（Python `shard_of` 改 `hash64`，负 id 语义对齐） |
+| **P1** | **C++ PS 仅单表**：忽略 `req.table()`，无法多模型版本/灰度 | ✅ **已修复**：server 侧 `table→ShardedEmbeddingTable` 映射 + 版本，`DoLookup` 按 `req.table()` 路由 |
+| **P1** | ~~路由哈希方案不统一（三次审阅新增）~~ | ✅ **M5 已修复**：`WorkerPool.worker_for` 从 `hash64%n` 取模改为复用同一 `Router`（jump 一致性哈希），worker 分派与 KV 分片同桶，扩缩容 remap 受控（8→9 桶 ≈0.116） |
 
-> 说明：本地后端（`LocalKVStore`）因「record 对象内联 `s_len`/`per_layer_len`」而正确，这属于**隐性依赖**，未固化到序列化契约——一旦切 datasystem 后端即触发 5.1 第一项回归，是「先单卡跑通、再切 datasystem」路径上的**最大的隐藏正确性风险**。
+> 说明：~~本地后端（`LocalKVStore`）因「record 对象内联 `s_len`/`per_layer_len`」而正确，这属于**隐性依赖**，未固化到序列化契约。~~ **已消除**：M5 起有效长度显式固化进 `serialize` header，datasystem 后端读写与 local 语义一致，隐性依赖转为显式契约。
 
 ### 5.2 可靠性（生产必补，当前缺失）
 
@@ -82,7 +90,7 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 | 熔断/限流 | 仅队列背压 | 按错误率熔断 + 令牌桶限流 |
 | 健康检查 | 无 | `/healthz` + 依赖探针 |
 | 优雅停机/排空 | `stop()` 仅 join | drain & wait 语义 |
-| append 原子性 | `offset` 乐观校验（进程内） | datasystem 原子 CAS / fencing token（§5.1 之外的一致性项） |
+| append 原子性 | ✅ **M5 已实现**：`DeltaKV.expect_checksum`（fencing token）CAS，offset+checksum 双校验，`cas_conflict` 拒绝不丢写 | （datasystem 原生原子 CAS 仍可后置） |
 
 ### 5.3 可观测性（无法线上排障）
 
@@ -104,7 +112,7 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 |---|---|---|---|
 | **P1** | 无 C++ Nearline/Online 热路径 worker：两阶段 brpc 分离部署目前仅 PS（`deploy/ps`）有 C++ 参考实现，混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/attention/mixed_attention.py`、`nn/ffn/mixed_ffn.py` | 以 Python 参照为数值基准，移植 Stage I/II 到 brpc+bthread worker + vLLM 自定义层 |
 | **P1** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径：`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`，行为流→查表→编码、特征服务→查表→打分未接线 | `pipeline.py`（`NearlineWorker.ingest` / `OnlineWorker.score` 签名收 `s_emb`/`ns_emb`） | 接通 `OneTransTokenizer` + `EmbeddingPSClient`（fabric ①）到 pipeline 入口 |
-| **P1** | KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」或「空 KV 兜底快速返回」 | `pipeline.py` L103-105 / L127-130 | 增加降级路径（设计 §8 已提，代码未实现） |
+| **P1** | ~~KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」或「空 KV 快速返回」~~ | ✅ **M5 已修复**：`OnlineWorker.score`/`score_batch` miss 返回全零 logits + `kv.miss` 打点，单/批一致、不抛异常（`pipeline.py`） | 「陈旧读」降级路径待 M6 与 G4 一并考虑 |
 | **P1** | 无服务发现 / 模型版本注册中心：PS/datasystem 的 host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | `embedding_ps_client.py`（默认 127.0.0.1:8000）、`datasystem_adapter.py`（默认 127.0.0.1:31501） | 引入轻量服务发现 + 模型注册 + 配置/灰度开关 |
 
 ---
@@ -112,5 +120,5 @@ KV 零拷贝： frombuffer 视图底层缓冲 + mmap 后端读侧零拷贝一致
 ## 6. 提交策略
 
 - **粒度**：按「修改点 / 功能」独立提交，commit message 用中文「类型: 描述」前缀（`fix:` / `feat:` / `perf:` / `docs:`）。
-- **频率**：每个功能点/修复点完成即提交并推送到远端 `origin`（凭据已配置，`credential.helper store`）。
+- **频率**：每个功能点/修复点完成即提交并推送到远端 `origin`（用户约定：代码与文档每次修改后直接 commit + push）。
 - **文档**：`docs/` 变更随对应功能同批或独立提交。

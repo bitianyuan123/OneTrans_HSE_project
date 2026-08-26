@@ -73,10 +73,13 @@ class LocalKVStore(KVStore):
             return rec
         # 只抽取指定层（读取为 frombuffer 视图，无整对象反序列化拷贝）
         per_layer = deserialize(rec.payload)
-        selected = [per_layer[l] for l in layers if l < len(per_layer)]
+        idx = [l for l in layers if 0 <= l < len(per_layer)]
+        selected = [per_layer[l] for l in idx]
         if not selected:
             return None
-        return _rebuild(rec, selected)
+        # 有效长度按层取子集（左 padding 语义，不能从 shape[1] 推断满宽）
+        pl = [rec.per_layer_len[l] for l in idx]
+        return _rebuild(rec, selected, per_layer_len=pl)
 
     def mget(self, keys: list[KVKey], *, layers: list[int] | None = None) -> list[Optional[UserKVRecord]]:
         return [self.get(k, layers=layers) for k in keys]
@@ -89,11 +92,15 @@ class LocalKVStore(KVStore):
                 return AppendResult(False, 0, "", reason="missing")
             if delta.offset != rec.s_len:
                 return AppendResult(False, rec.s_len, "", reason="offset_conflict")
+            if delta.expect_checksum and delta.expect_checksum != rec.checksum:
+                # G2 CAS fencing：expect_checksum 不匹配即拒绝（不丢写）
+                return AppendResult(False, rec.s_len, "", reason="cas_conflict")
             per_layer = deserialize(rec.payload)
             if len(per_layer) != len(delta.tensors):
                 return AppendResult(False, rec.s_len, "", reason="layer_mismatch")
             merged = [_cat_pair(p, d) for p, d in zip(per_layer, delta.tensors)]
-            new_rec = _rebuild(rec, merged, s_len=rec.s_len + delta.delta_len)
+            new_pl = [pl + delta.delta_len for pl in rec.per_layer_len]
+            new_rec = _rebuild(rec, merged, s_len=rec.s_len + delta.delta_len, per_layer_len=new_pl)
             self._persist(new_rec)
             return AppendResult(True, new_rec.s_len, new_rec.checksum)
 
@@ -153,14 +160,21 @@ def _rebuild(
     rec: UserKVRecord,
     per_layer: list[tuple[Any, Any]],
     s_len: int | None = None,
+    per_layer_len: list[int] | None = None,
 ) -> UserKVRecord:
-    """用新的逐层张量重建记录（保持 key/版本/时间戳，重算长度与 checksum）。"""
+    """用新的逐层张量重建记录（保持 key/版本/时间戳，重算长度与 checksum）。
+
+    ``per_layer_len`` 显式传入时按有效长度序列化（左 padding 语义），否则回退为
+    逐层全宽推断（兼容无 padding 场景）。
+    """
+    s = rec.s_len if s_len is None else s_len
+    pl = [k.shape[1] for k, _ in per_layer] if per_layer_len is None else per_layer_len
     return UserKVRecord(
         key=rec.key,
-        s_len=rec.s_len if s_len is None else s_len,
-        per_layer_len=[k.shape[1] for k, _ in per_layer],
+        s_len=s,
+        per_layer_len=pl,
         dtype=rec.dtype,
-        payload=serialize(per_layer),
+        payload=serialize(per_layer, s_len=s, per_layer_len=pl),
         seq_ts_last=rec.seq_ts_last,
         created_at=rec.created_at,
     )

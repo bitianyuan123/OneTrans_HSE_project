@@ -59,7 +59,7 @@ class NearlineWorker:
         self.metrics.count("nearline.events_ingested", 1.0)
 
         with self.metrics.timing("nearline.append_kv"):
-            payload = serialize(kv.per_layer)
+            payload = serialize(kv.per_layer, s_len=kv.s_len, per_layer_len=kv.per_layer_len)
             rec = UserKVRecord(
                 key=KVKey(model_version=model_version, user_id=user_id),
                 s_len=kv.s_len,
@@ -85,6 +85,7 @@ class OnlineWorker:
         self.runner = runner
         self.store = store
         self.metrics = metrics or ServingMetrics()
+        self._num_tasks = self.runner.linear.out_features
 
     def score(
         self,
@@ -101,8 +102,9 @@ class OnlineWorker:
         with self.metrics.timing("online.kv_get"):
             rec = self.store.get(key)
         if rec is None:
+            # KV miss（冷启动/过期/搬迁）：返回全零 legal logits，不抛异常（见 gap_analysis G8）
             self.metrics.count("kv.miss", 1.0)
-            raise KeyError(f"user KV missing: {key}")
+            return torch.zeros(ns_emb.shape[0], self._num_tasks, device=ns_emb.device)
         self.metrics.count("kv.hit", 1.0)
 
         with self.metrics.timing("online.encode_stage2"):
@@ -123,24 +125,39 @@ class OnlineWorker:
             recs = self.store.mget(keys)
         kvs: list[Any] = []
         embs: list[Tensor] = []
+        miss_positions: list[int] = []
+        flat = 0
         for rec, req in zip(recs, batch):
+            m = req.ns_emb.shape[0]
             if rec is None:
                 self.metrics.count("kv.miss", 1.0)
-                raise KeyError(f"user KV missing: {req.key}")
-            self.metrics.count("kv.hit", 1.0)
-            kv = decode_record(rec, req.ns_emb.device)
-            # 同用户多候选：kv 重复、候选展平
-            m = req.ns_emb.shape[0]
-            for _ in range(m):
-                kvs.append(kv)
-            embs.append(req.ns_emb)
-        ns_emb = torch.cat(embs, dim=0)  # [B, Ns, D]
-        with self.metrics.timing("online.encode_stage2"):
-            logits = self.runner.score_ns_batch(kvs, ns_emb)
+                miss_positions.extend(range(flat, flat + m))  # 记录 miss 候选的展平位置
+            else:
+                self.metrics.count("kv.hit", 1.0)
+                kv = decode_record(rec, req.ns_emb.device)
+                # 同用户多候选：kv 重复、候选展平
+                for _ in range(m):
+                    kvs.append(kv)
+                embs.append(req.ns_emb)
+            flat += m
+        total = flat
+
+        # miss 降级：命中候选正常打分，miss 候选填全零，保持 [B, T] 与展平顺序（见 gap_analysis G8）
+        out = torch.zeros(total, self._num_tasks, device=batch[0].ns_emb.device)
+        if kvs:
+            ns_emb = torch.cat(embs, dim=0)  # [num_hits, Ns, D]
+            with self.metrics.timing("online.encode_stage2"):
+                logits = self.runner.score_ns_batch(kvs, ns_emb)  # [num_hits, T]
+            miss_set = set(miss_positions)
+            hit_ptr = 0
+            for i in range(total):
+                if i not in miss_set:
+                    out[i] = logits[hit_ptr]
+                    hit_ptr += 1
         self.metrics.count("online.qps", float(len(batch)))
-        self.metrics.count("online.candidate_throughput", float(ns_emb.shape[0]))
-        self.metrics.gauge("online.batch_size", float(ns_emb.shape[0]))
-        return logits
+        self.metrics.count("online.candidate_throughput", float(total))
+        self.metrics.gauge("online.batch_size", float(total))
+        return out
 
 
 @dataclass

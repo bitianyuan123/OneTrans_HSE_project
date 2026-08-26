@@ -243,18 +243,18 @@ deploy/ps/
 
 | 级别 | 缺口 | 位置 | 影响 |
 |---|---|---|---|
-| **P1（正确性）** | datasystem 后端丢失 `s_len`/`per_layer_len`，左 padding 掩码错误 | `serialize.py` / `datasystem_adapter.py` | 子满长用户的在线打分错误 |
-| **P1（一致性）** | PS 跨语言分片哈希不等价 | `embedding_ps_client.py` vs `embedding_server.cc` | 分片路由不一致风险 |
-| **P1** | C++ PS 仅单表，忽略 `table` | `embedding_server.cc` | 无法多模型版本灰度 |
-| **P1（可靠性）** | 无超时/重试/熔断/健康检查/优雅停机 | `dispatcher.py`/客户端 | 生产稳定性 |
-| **P1（一致性）** | datasystem append 非原子（RMW + TOCTOU） | `datasystem_adapter.py` | 并发写脏数据风险 |
-| **P1（一致性）** | 路由哈希不统一（jump vs modulo vs Knuth），破坏 KV/worker 数据本地性 | `sharded.py`/`dispatcher.py`/`embedding_ps_client.py` | user 的 KV 与 worker 不共址、扩缩容全量 remap |
-| **P1（可观测）** | 指标仅内存，无导出/日志/追踪 | `metrics.py` | 无法线上观测 |
-| **P1（落地）** | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考实现），混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/mixed_*` | 两阶段 brpc 分离部署仍为设计态 |
-| **P1（落地）** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径（`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`） | `pipeline.py` | 行为流→查表→编码、特征服务→查表→打分 未端到端接线 |
-| **P1（落地）** | KV miss 硬失败（`raise KeyError`）无降级；无服务发现/模型版本注册中心（host/port 硬编码） | `pipeline.py`、`embedding_ps_client.py`/`datasystem_adapter.py` | 不可灰度、不可容错 |
+| ~~**P1（正确性）**~~ | ✅ **M5 已修复**：`serialize` header 固化 `s_len`/`per_layer_len`，datasystem 读写语义与 local 一致 | `serialize.py` / `datasystem_adapter.py` | （已消除）子满长用户的在线打分错误 |
+| ~~**P1（一致性）**~~ | ✅ 已修复：PS 跨语言分片哈希统一到 Knuth | `embedding_ps_client.py` vs `embedding_server.cc` | （已消除）分片路由不一致风险 |
+| ~~**P1**~~ | ✅ 已修复：C++ PS 多表（`table→ShardedEmbeddingTable` + 版本） | `embedding_server.cc` | （已消除）无法多模型版本灰度 |
+| **P1（可靠性）** | 无超时/重试/熔断/健康检查/优雅停机 | `dispatcher.py`/客户端 | 生产稳定性（M6） |
+| ~~**P1（一致性）**~~ | ✅ **M5 已缓解**：`DeltaKV.expect_checksum` CAS fencing，`cas_conflict` 拒绝（datasystem 原生原子 CAS 仍可后置） | `datasystem_adapter.py` | （已缓解）并发写脏数据风险 |
+| ~~**P1（一致性）**~~ | ✅ **M5 已修复**：`WorkerPool.worker_for` 复用 `Router`（jump 哈希），路由统一 | `sharded.py`/`dispatcher.py`/`embedding_ps_client.py` | （已消除）user 的 KV 与 worker 不共址、扩缩容全量 remap |
+| **P1（可观测）** | 指标仅内存，无导出/日志/追踪 | `metrics.py` | 无法线上观测（M6） |
+| **P1（落地）** | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考实现），混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/mixed_*` | 两阶段 brpc 分离部署仍为设计态（M8） |
+| **P1（落地）** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径（`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`） | `pipeline.py` | 行为流→查表→编码、特征服务→查表→打分 未端到端接线（M7） |
+| **P1（落地）** | ~~KV miss 硬失败无降级~~（✅ M5 已修复：miss 返回全零 + 打点）；无服务发现/模型版本注册中心（host/port 硬编码，M7） | `pipeline.py`、`embedding_ps_client.py`/`datasystem_adapter.py` | 不可灰度、容错部分已具备 |
 | P2 | redis 后端、HBM 直通 | `kv_store.py`/`datasystem_adapter.py` | 环境依赖 |
 | P2 | 无测试框架/CI | 全局 | 回归保障弱（`demo.py` 单脚本 assert） |
 | P2 | `_project_ns`/`_apply_ns_ffn` 逐 token 循环、`RingHash` 建环 O(n²)、percentile 全样本 | `two_stage.py`/`router.py`/`metrics.py` | 局部性能（Ns 小，可容忍） |
 
-> 上述分级对应「实现 & 现状」文档的差距评估章节。
+> 上述分级对应「实现 & 现状」文档的差距评估章节；M5（G1/G2/G3/G8）已完成正确性收口，剩余缺口按 M6（可靠+观测）→ M7（热路径接线）→ M8（C++ 移植）推进，详见 `gap_analysis.md` 第四部分路线图。
