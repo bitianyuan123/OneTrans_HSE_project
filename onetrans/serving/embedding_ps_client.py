@@ -3,7 +3,7 @@
 稀疏 embedding 独立服务化（C++ brpc 侧见 ``deploy/ps/``），本模块是 Python 侧：
 
 - :class:`ShardedEmbeddingTable`：按 id 稳定哈希分片的 embeding 表（每分片独立锁），
-  与 C++ 侧 ``ShardedEmbeddingTable`` 语义一致；
+  与 C++ 侧 ``ShardedEmbeddingTable`` 语义一致（分片路由统一 Knuth 乘法哈希，G10）；
 - :class:`LocalEmbeddingPS`：进程内多表 PS（供单机数值/并发基准）；
 - :class:`EmbeddingPSClient`：独立 PS 数据面客户端，``local`` 走进程内分片表，
   ``remote`` 走 brpc RPC（wire 契约见 ``deploy/ps/embedding_service.proto``）。
@@ -20,7 +20,9 @@ from typing import Any, Optional
 import torch
 from torch import Tensor
 
-from onetrans.serving.router import hash64
+# Knuth 乘法哈希常数：与 deploy/ps/embedding_server.cc 的 detail::ShardOf 同一标准（G10）。
+# 读写两侧必须对同一 id 落同一分片，故 Python 侧不再用 router.hash64（sha256）。
+_KNUTH = 0x9E3779B97F4A7C15
 
 
 class ShardedEmbeddingTable:
@@ -38,7 +40,11 @@ class ShardedEmbeddingTable:
 
     # -- 路由 ------------------------------------------------------------ #
     def shard_of(self, feat_id: int) -> int:
-        return hash64(str(feat_id)) % self.num_shards
+        # 与 C++ detail::ShardOf 逐位对齐：
+        #   1) 负 id 按二补码回绕到 uint64（对齐 static_cast<uint64_t>）；
+        #   2) 乘法结果按 2^64 截断（对齐 uint64 自然溢出）；
+        #   3) 再对 num_shards 取模。
+        return (((feat_id & 0xFFFFFFFFFFFFFFFF) * _KNUTH) & 0xFFFFFFFFFFFFFFFF) % self.num_shards
 
     # -- 读写 ------------------------------------------------------------ #
     def set(self, feat_id: int, weights: list[float]) -> None:

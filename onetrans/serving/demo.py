@@ -447,11 +447,15 @@ def test_embedding_ps() -> None:
     assert got[1].abs().sum().item() > 0  # 兜底非全零
     print(f"独立 PS 数据面： [ok] 分片查表命中/seed 兜底确定性，版本={v1}")
 
-    # 分片稳定性：同 feat_id 恒落同一分片
+    # 分片稳定性：同 feat_id 恒落同一分片；Knuth 黄金值与 C++ detail::ShardOf 逐位对齐（G10）
     from onetrans.serving.embedding_ps_client import ShardedEmbeddingTable
     tbl = ShardedEmbeddingTable(num_shards=8, dim=dim)
     assert tbl.shard_of(1234) == tbl.shard_of(1234)
-    print(f"  分片稳定性： [ok] 同 id 稳定映射分片={tbl.shard_of(1234)}")
+    # 黄金值：1234 的 Knuth 乘法哈希 % 8 == 2（与 C++ static_cast<uint64_t>*kKnuth)%8 一致）
+    assert tbl.shard_of(1234) == 2
+    # 负 id 二补码回绕语义：shard_of(-x) == shard_of(2^64 - x)（对齐 C++ static_cast<uint64_t>）
+    assert tbl.shard_of(-1234) == tbl.shard_of(2**64 - 1234)
+    print(f"  分片稳定性： [ok] 同 id 稳定映射分片={tbl.shard_of(1234)}（Knuth 跨语言等价）")
 
 
 def test_weight_loader() -> None:
