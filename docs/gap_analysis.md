@@ -372,6 +372,8 @@ class Dispatcher:
 
 ### 3.6 G6：C++ 热路径移植（分阶段）
 
+> 目标形态（接入/编排/引擎/数据面的 C++ 生产组件视图）已在 [detailed_design.md §7.1.1](./detailed_design.md) 固化为**主架构视图**；Python 参照实现定位降级为「数值黄金基准 + 并发协议 harness」（GIL 约束分析见 §7.1.2），性能结论一律以 C++ 生产实现为准。G6 是通往工程级的最高优先级主线。
+
 #### 分阶段路线
 
 - **M8a 算子级 C++ 移植 + 数值对齐**：优先移植 `encode_s` 与 `score_ns` 的算子级核心（`_project_s`/`_project_ns`、`_apply_ns_ffn`、scaled-dot-product attention、`_s_attn_mask`/`_cross_attn_mask`）为单一 C++ 扩展（或自定义 op），保持与 Python `two_stage.py` 逐层一致。**黄金基准**：`/workspace/onetrans/serving/two_stage.py` 的 `encode_s/score_ns/score_ns_batch` 与 `demo.py:test_equivalence`（断言 `max|diff| < 1e-4`）。移植中逐步收紧到 1e-6。

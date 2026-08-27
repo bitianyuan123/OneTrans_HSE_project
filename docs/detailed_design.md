@@ -1,6 +1,6 @@
 # 序列 Transformer 精排系统 详细设计
 
-> 版本：v0.3（三次修订：深化为「业务诉求 → 需求分析 → 输入输出 → 功能设计 → 实现分析 → 实现思路 → 实现设计」全链路详细设计，补齐架构图/处理过程/数据流图/线程及处理模型/伪代码/关键结构体）
+> 版本：v0.4（四次修订：**架构主视图切换为 C++/brpc 生产形态（§7.1.1）**，Python 参照实现降级为正确性 harness 并补 GIL 影响的诚实分析（§7.1.2）；v0.3 建立「业务诉求 → 需求分析 → 输入输出 → 功能设计 → 实现分析 → 实现思路 → 实现设计」全链路结构）
 > 上游：[端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6）
 > 下游关联：[工程级详细设计](./engineering_design.md)（部署/线程模型生产形态）、[差距分析](./gap_analysis.md)（G1~G14）、[实现 & 现状](./implementation_status.md)
 > 本文以仓库 `feat/onetrans-e2e-serving` 分支当前代码为准（M5 正确性收口已完成）。
@@ -14,7 +14,7 @@
 | 产品/业务方 | §1 业务诉求、§2 需求分析、§3 输入输出 |
 | 算法工程师 | §4.2 核心算法、§6.2 两阶段等价性论证 |
 | 存储工程师 | §4.3 KV 接口契约、§7.6 关键数据结构、§7.7 序列化布局 |
-| 后端/并发工程师 | **§7.4 线程与并发模型**（含具体请求端到端走读） |
+| 后端/并发工程师 | **§7.1.1 生产架构（主视图）**、**§7.4 线程与并发模型**（含具体请求端到端走读） |
 | 交付负责人 | §5 实现分析、§8 实现状态对照与差距 |
 
 约定符号：`D=d_model`，`H=num_heads`，`d=head_dim=D/H`，`L=num_blocks`，`Ns=ns_tokens_num`，`S_len` 有效序列长度，`M` 单请求候选数，`B` batch 维，`ΔL` 增量行为条数。
@@ -367,7 +367,60 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 
 ### 7.1 软件架构（详细架构图）
 
-#### 7.1.1 组件视图（单机参照实现，全组件）
+#### 7.1.1 生产架构组件视图（C++/brpc，工程级目标形态 —— 主视图）
+
+> 这是本系统的**主架构视图**：入口、编排、热路径全部为 C++（与主流生产精排一致）。
+> Python 参照实现（§7.1.2）仅承担数值基准与协议验证职责，**不是**系统入口。
+
+```
+        上游排序服务（召回/粗排下游）             行为流（Kafka/MQ，按 user_id 哈希分区）
+        brpc/gRPC 客户端                          分区消费者组
+             │ OnlineRank.Score(uid, 候选特征)         │ Ingest(uid, ΔL 行为特征)
+             ▼                                            ▼
+╔══════════ 接入层：Online / Nearline brpc Server（独立服务进程）════════════╗
+║  bthread-per-RPC：M:N 协程调度（无解释器锁，单机十万级并发长连接）          ║
+║  过载保护：max_concurrency 方法级限流 → 快速拒绝 ELIMIT（背压给调用方）      ║
+║  超时/取消：Controller.timeout_ms + done 回调链（全链路 deadline 传递）     ║
+║  服务发现：注册中心（模型版本/分片拓扑 → 调用方路由表）          [G9]      ║
+╚═════════╤══════════════════════════════════════════════════╤═════════════╝
+          │ jump(uid) 一致性哈希 = KV 分片桶号（数据本地化前提）  │ 同一哈希域
+          ▼                                                    ▼
+╔════════ 编排层：Dispatcher + 每 worker 独立有界 mpsc 队列 ══════════════════╗
+║  N 个 C++ worker 线程：内核态并行调度，无 GIL；可绑核 / NUMA 亲和            ║
+║  req_seq 异步匹配 + 乱序完成：done(Controller) 点对点回调，无共享出队      ║
+║  Dynamic batching：满批 or max_wait 超时出批（[ΣM,·,·] 整批单次前向）      ║
+╚═════════╤═════════════════════════════════════╤═══════════════════════════╝
+          │ Stage I：encode_s（B=1）             │ Stage II：score_ns_batch（B=ΣM）
+          ▼                                       ▼
+╔════════ 引擎层：C++ TwoStageRunner（ATen 算子 → 自定义 CUDA kernel）═════════╗
+║  混合参数化 op：W_s 共享投影（S 段）+ W_ns_list 逐 token 投影（NS 段）      ║
+║  算子内真并行：at::parallel_for（intra-op 线程池/OpenMP）；逐层循环在 C++ 内  ║
+║  KV 内存布局：per-layer 连续张量 + pyramid@read 尾部裁剪（读侧带宽优化）    ║
+╚═════════╤═══════════════════════════════════╤══════════════════════════════╝
+          │ put / append(offset+CAS)            │ mget（shard 内聚合批量读）
+          ▼                                       ▼
+╔════════ 数据面（全部 C++ 客户端）═══════════════════════════════════════════╗
+║  KVStore SDK → datasystem 集群：HBM/DRAM/SSD 多级缓存 + RDMA 零拷贝传输     ║
+║  EmbeddingPSClient → PS 集群（deploy/ps：brpc 多表 + Knuth 分片）✅已就绪   ║
+║  MetaStore SDK → Redis Cluster（KVPointer + TTL + model_version）           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+```
+
+**各层实现状态**（诚实标注，避免把目标形态当成已交付）：
+
+| 层 | 生产组件 | 状态 | 说明 |
+|---|---|---|---|
+| 接入层 | Online/Nearline brpc Server | 🔧 待 M8b | 服务入口、限流、超时/取消均未落地 |
+| 编排层 | Dispatcher + mpsc 队列 | ◐ 协议已验证 | 乱序匹配/背压/攒批协议在 Python harness 验证正确（§7.4），C++ 实现待 M8b |
+| 引擎层 | C++ TwoStageRunner | 🔧 待 M8a→M8c | 先算子级移植并对齐 Python 基准（≤1e-6），后 vLLM 自定义 op |
+| 数据面 | PS / KV SDK / Meta SDK | ◐ PS 已就绪 | `deploy/ps`（brpc 多表+Knuth 分片）可部署；KV/Meta 的 C++ SDK 待接 |
+| 存储后端 | datasystem / Redis / MQ | 外部系统 | 经 adapter/SDK 接入，存储后端对上层透明 |
+
+**与主流工程级精排的对齐点**：入口为 C++ RPC 服务（非 Python 进程）、协程化 IO（bthread）与真实多线程 worker、C++ 数据面客户端（PS/KV 直连，无 Python 中转）、热路径无解释器参与。Python 在本系统的合理位置只有两处：离线训练/实验，以及（过渡期）数值黄金基准。
+
+#### 7.1.2 参照实现组件视图（Python 单机 harness —— 正确性基准）
+
+当前仓库实际交付形态：算法/协议/契约的验证载体（模块路径即组件名），**不是**生产入口。
 
 ```
                     调用方线程（M 个）                     Nearline 触发源（行为流消费者）
@@ -423,15 +476,32 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 ╚════════════════════════╝              ╚═════════════════════════════╝
 ```
 
-#### 7.1.2 分层职责与依赖方向
+**该视图验证什么 / 不验证什么**（GIL 影响的诚实分析）：
 
-| 层 | 模块 | 职责 | 只依赖 |
-|---|---|---|---|
-| 编排 | dispatcher / pipeline(BatchScheduler) | 并发调度、攒批、请求生命周期 | 引擎、数据面 |
-| worker | pipeline(Nearline/Online) | 阶段编排、降级、埋点 | 引擎、数据面、指标 |
-| 引擎 | two_stage | 张量计算（编码/打分） | 模型层 |
-| 数据面 | kv_store/serialize/local_adapter/datasystem_adapter/sharded/meta_store | 存储语义、序列化、分片、元数据 | torch（张量字节） |
-| 横切 | router / metrics / weight_loader | 路由、指标、权重 | — |
+| 环节 | GIL 事实 | 工程后果 |
+|---|---|---|
+| `two_stage.py` 逐层 `for block` / 逐 token `W_ns_list[i]` 循环 | 纯 Python 段全程持 GIL | **N 个 worker 线程在计算段完全串行**——多线程在此无并行收益 |
+| torch CPU 算子 | kernel 执行期释放 GIL | 大算子可重叠；但本实现算子被 Python 循环切碎（cat/逐 token 投影），单算子太薄，重叠收益有限 |
+| KV get/put、序列化 | 部分 C 实现（bytes/memmove） | 仅少量 IO 重叠 |
+| demo「30 请求并发完成」 | 验证 req_seq 匹配/背压/乱序/同 user 串行化 | **是协议正确性结论，不是吞吐/并行性能结论** |
+
+因此 Python 参照实现**只**用于交付三类结论：
+1. **数值黄金基准**：两阶段 vs 单前向等价性（≤6.7e-8）、序列化 roundtrip、append CAS 语义、掩码重构不变量——作为 C++ 移植（M8a）的验收标准；
+2. **并发协议验证**：req_seq 乱序匹配、有界队列背压、同 user 哈希串行化、攒批窗口语义——语言无关协议在真实并发交错下无竞态；
+3. **契约固化**：KVStore 协议、payload 内存布局、PS wire 协议（proto）、指标语义。
+
+**性能结论（吞吐/QPS/时延 SLO/扩展性）一律以 C++ 生产实现（§7.1.1）为准**，Python harness 的任何性能数字只作回归对照，不得外推。
+
+#### 7.1.3 分层职责与依赖方向
+
+| 层 | 生产实现（目标形态） | 参照实现（Python，已交付） | 职责 | 只依赖 |
+|---|---|---|---|---|
+| 接入 | brpc Online/Nearline Server 🔧M8b | —（demo 直接调 Dispatcher） | RPC 入口、限流、超时/取消 | 编排 |
+| 编排 | Dispatcher + mpsc 队列 🔧M8b | dispatcher.py / pipeline.py(BatchScheduler) | 并发调度、攒批、请求生命周期 | 引擎、数据面 |
+| worker | C++ worker 线程 🔧M8b | pipeline.py(Nearline/Online) | 阶段编排、降级、埋点 | 引擎、数据面、指标 |
+| 引擎 | C++ TwoStageRunner 🔧M8a→M8c | two_stage.py | 张量计算（编码/打分） | 模型层 |
+| 数据面 | KV/Meta C++ SDK 🔧；PS ✅deploy/ps | kv_store/serialize/local_adapter/datasystem_adapter/sharded/meta_store | 存储语义、序列化、分片、元数据 | torch（张量字节） |
+| 横切 | 路由（Knuth/jump 哈希跨语言同构）/ 指标 / 权重 | router.py / metrics.py / weight_loader.py | 路由、指标、权重 | — |
 
 **关键解耦**：worker 只依赖 `KVStore` 协议与 `TwoStageRunner`，不感知后端；后端经 `build_kv_store(KVConfig)` 注入；指标经 `ServingMetrics`（满足 `MetricsSink` 协议可替换）。
 
@@ -631,6 +701,8 @@ C1 ─submit(r1)─┐                      ┌─submit(r2) C2          submit(
 ```
 
 ### 7.4 线程与并发模型（重点）
+
+**定位声明**：本节描述的是**语言无关的线程协作协议**（职责/唤醒/协作/乱序匹配）。7.4.1~7.4.6 以 Python 参照实现为载体说明协议语义；生产实现为 C++（brpc bthread + N 个真实 worker 线程，见 7.4.7 映射）。**注意**：Python 受 GIL 限制，其多线程仅验证协议正确性（乱序/背压/同 user 串行化），不提供并行性能——性能语义以 7.4.7 的生产映射为准。
 
 代码位置：[dispatcher.py](file:///workspace/onetrans/serving/dispatcher.py)、[pipeline.py](file:///workspace/onetrans/serving/pipeline.py)（BatchScheduler）。
 
@@ -1011,7 +1083,7 @@ raw_bytes = concat(K_s^0, V_s^0, K_s^1, V_s^1, ..., K_s^{L-1}, V_s^{L-1})   # �
 
 **已实现并验证（`demo.py` 全绿）**：两阶段数值等价（≤6.7e-8）/ 序列化 roundtrip + 元数据固化（G1）/ append offset+CAS（G2）/ KV miss 降级（G8）/ 路由统一 worker_for==Router.route（G3）/ 零拷贝 / jump remap=0.116 / 元数据 TTL / 分片本地化 / 攒批 + miss/hit 混批 / 30 并发 req_seq 匹配 + 背压 / PS Knuth 跨语言等价（G10）/ 多表（G11）/ 权重版本化。
 
-**待实现（详见 [gap_analysis.md](./gap_analysis.md)）**：G4 可靠性四件套（超时/重试/熔断/优雅停机，M6）、G5 可观测导出（M6）、G7 tokenizer+embedding 接线（M7）、G9 服务发现/注册（M7）、G6 C++ 热路径移植 M8a→M8c、G12~G14（P2）。
+**待实现（详见 [gap_analysis.md](./gap_analysis.md)）**：**G6 C++ 生产热路径（M8a 算子 → M8b brpc Online/Nearline 服务 → M8c vLLM 自定义 op）——通往工程级的最高优先级主线，§7.1.1 主视图即其目标形态**；G4 可靠性四件套（超时/重试/熔断/优雅停机，M6）、G5 可观测导出（M6）、G7 tokenizer+embedding 接线（M7）、G9 服务发现/注册（M7）、G12~G14（P2）。Python 参照实现定位为正确性 harness（§7.1.2），性能结论以 C++ 生产实现为准。
 
 **里程碑**：M0~M2、M5 ✅｜M3（负载实验）、M6、M7、M8、M4（基线对比）待做。
 
