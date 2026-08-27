@@ -1,6 +1,6 @@
 # 实现 & 现状总结
 
-> 版本：v1.3（真实 folly 引入 + datasystem C++ SDK 接入；正确性以 golden 二进制对拍为准，Python 不作为验证基准）
+> 版本：v1.4（差距评估基线切换：详设目标态 ↔ C++ 工程主线对评，差距编号 D1~D9；正确性以 golden 二进制对拍为准，Python 不作为验证基准）
 > 分支：`feat/onetrans-e2e-serving`
 > 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计见 [detailed_design.md](./detailed_design.md)。
 
@@ -116,54 +116,23 @@ append 乐观并发： 正确 offset 接受 / offset_conflict 拒绝 / cas_confl
 
 ---
 
-## 5. 工程级差距评估（二次审阅产出）
+## 5. 工程级差距评估（对照 C++ 主线重评，基线 = 详设目标态）
 
-对照「工程级可用的推荐系统精排」逐项评估，结论分三类：**正确性（P0/P1）、可靠性（P1）、工程化（P1/P2）**。
+> 评估口径：**目标=detailed_design.md 的系统设计，现状=cpp/ C++ 工程主线**；Python 侧（`onetrans/`、`cpp/tools/*.py`）分别承担 golden 生成源与验证工具链角色，不作为验证基准。差距编号 D1~D9 的完整分析（差距本质/在线后果/落点设计/验收标准）见 [gap_analysis.md](./gap_analysis.md) 第二部分；此处只列结论。
 
-### 5.1 正确性（需修复，否则在线结果可能错误）
-
-| 级别 | 问题 | 证据（代码位置） | 建议 |
+| 级别 | 差距（对照详设章节） | C++ 现状证据 | 编号 |
 |---|---|---|---|
-| **P1** | ~~datasystem 后端**丢失有效长度元数据**~~ | ✅ **M5 已修复**：`serialize` header 固化 `s_len`+`per_layer_len`（`serialize.py` `read_header`/`deserialize_with_meta`，向后兼容），`NearlineWorker.ingest` 写入、`YuanrongKVStore.get`/`append` 读回，datasystem 后端与 local 语义一致 |
-| **P1** | **PS 跨语言分片哈希不等价**：Python `hash64(str(id))`（sha256）≠ C++ `(id*Knuth)%n`；`embedding_server.cc` 注释误称「同构」 | ✅ **已修复**：统一到 C++ Knuth 乘法哈希（Python `shard_of` 改 `hash64`，负 id 语义对齐） |
-| **P1** | **C++ PS 仅单表**：忽略 `req.table()`，无法多模型版本/灰度 | ✅ **已修复**：server 侧 `table→ShardedEmbeddingTable` 映射 + 版本，`DoLookup` 按 `req.table()` 路由 |
-| **P1** | ~~路由哈希方案不统一（三次审阅新增）~~ | ✅ **M5 已修复**：`WorkerPool.worker_for` 从 `hash64%n` 取模改为复用同一 `Router`（jump 一致性哈希），worker 分派与 KV 分片同桶，扩缩容 remap 受控（8→9 桶 ≈0.116） |
+| P1 | 接入层未换装 brpc/bthread（自研 HTTP，无 keep-alive/方法级限流）（§7.4.2 Ingress） | [net/http_server.cpp](file:///workspace/cpp/src/net/http_server.cpp)（`Connection: close`；`route_async` 异步语义已对齐） | D1 |
+| P1 | 稀疏 PS 数据面未接入在线热路径：查表为进程内整表直查，无 C++ PS 客户端（§7.4.2/§7.9） | [serving/embed_lookup.h](file:///workspace/cpp/src/serving/embed_lookup.h)（`LookupFn` 替换缝已预留）；`deploy/ps` 存在但 bazel 构建、未接 `cpp/CMakeLists.txt` | D2 |
+| P1 | datasystem KV 后端代码就绪但未联调：SDK 未构建部署，运行时实际为 LocalKVStore（§7.4.6） | [kv/datasystem_store.cpp](file:///workspace/cpp/src/kv/datasystem_store.cpp)（对真实 SDK 头校验通过；`ONETRANS_WITH_DATASYSTEM` 默认 OFF） | D3 |
+| P1 | 可靠性：无超时/重试/熔断，`/healthz` 不探依赖（§7.8） | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) 阶段闭包与 `KVStore::get` 均无 deadline；仅队列背压 | D4 |
+| P1 | 可观测性：指标仅 counter/gauge 均值型，无 P99/req_id/trace/Prometheus 格式（§7.8） | [serving/pipeline.h](file:///workspace/cpp/src/serving/pipeline.h) `Metrics` | D5 |
+| P1-Mid | 无服务发现/版本注册/灰度（§7.8 版本化） | [server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) CLI 参数 | D6 |
+| P1-Mid | Nearline/Online 未分离部署，单进程同宿（§7.9） | [server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) 同挂 `/ingest`+`/score` | D7 |
+| P2 | 无 CI 流水线/性能基准回归 | `verify_golden`+`e2e_test` 手工触发 | D8 |
+| P2 | 混合参数化层未做 vLLM 自定义 op（M8c） | [tools/bridge_score.py](file:///workspace/cpp/tools/bridge_score.py) eager 前向 | D9 |
 
-> 说明：~~本地后端（`LocalKVStore`）因「record 对象内联 `s_len`/`per_layer_len`」而正确，这属于**隐性依赖**，未固化到序列化契约。~~ **已消除**：M5 起有效长度显式固化进 `serialize` header，datasystem 后端读写与 local 语义一致，隐性依赖转为显式契约。
-
-### 5.2 可靠性（生产必补，当前缺失）
-
-| 能力 | 现状 | 建议 |
-|---|---|---|
-| 客户端超时 | `Future` 无 deadline | KV/PS/RPC 加超时与 cancel |
-| 重试 & 幂等 | 无 | 读幂等重试；写幂等键/版本 |
-| 熔断/限流 | 仅队列背压 | 按错误率熔断 + 令牌桶限流 |
-| 健康检查 | 无 | `/healthz` + 依赖探针 |
-| 优雅停机/排空 | `stop()` 仅 join | drain & wait 语义 |
-| append 原子性 | ✅ **M5 已实现**：`DeltaKV.expect_checksum`（fencing token）CAS，offset+checksum 双校验，`cas_conflict` 拒绝不丢写 | （datasystem 原生原子 CAS 仍可后置） |
-
-### 5.3 可观测性（无法线上排障）
-
-- 指标：`ServingMetrics` 仅内存收集，无 Prometheus/OTel 导出；percentile 全样本存储（O(n)）。
-- 日志：无结构化日志（缺 req_id/trace_id 贯穿）。
-- 追踪：无分布式 trace（路由/读 KV/打分/PS 查表）。
-
-### 5.4 工程化 / 性能（P2）
-
-- **无测试框架/CI**：`demo.py` 单脚本 `assert`，无 pytest/coverage/CI，回归保障弱。
-- **局部性能**：`_project_ns`/`_apply_ns_ffn` 逐 token Python 循环（Ns=8 可容忍）；`RingHash` 建环 O(vnodes·n²)；percentile 全样本排序。
-- **未接入项**：PS remote 数据面（Python→brpc）、redis 后端、datasystem HBM 直通、vLLM 自定义 op 移植。
-
-### 5.5 集成 / 落地缺口（P1，三次审阅新增）
-
-对照「工程级精排」的**端到端可运行性**，除 §5.1~§5.4 外仍有**尚未接线的链路**，属「单卡参照已通、集群落地未通」：
-
-| 级别 | 缺口 | 证据 | 建议 |
-|---|---|---|---|
-| **P1** | 无 C++ Nearline/Online 热路径 worker：两阶段 brpc 分离部署目前仅 PS（`deploy/ps`）有 C++ 参考实现，混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/attention/mixed_attention.py`、`nn/ffn/mixed_ffn.py` | 以 golden 二进制为数值基准，移植 Stage I/II 到 brpc+bthread worker + vLLM 自定义层 |
-| **P1** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径：`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`，行为流→查表→编码、特征服务→查表→打分未接线 | `pipeline.py`（`NearlineWorker.ingest` / `OnlineWorker.score` 签名收 `s_emb`/`ns_emb`） | 接通 `OneTransTokenizer` + `EmbeddingPSClient`（fabric ①）到 pipeline 入口 |
-| **P1** | ~~KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」或「空 KV 快速返回」~~ | ✅ **M5 已修复**：`OnlineWorker.score`/`score_batch` miss 返回全零 logits + `kv.miss` 打点，单/批一致、不抛异常（`pipeline.py`） | 「陈旧读」降级路径待 M6 与 G4 一并考虑 |
-| **P1** | 无服务发现 / 模型版本注册中心：PS/datasystem 的 host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | `embedding_ps_client.py`（默认 127.0.0.1:8000）、C++ `DatasystemKVStore::Options`（默认 127.0.0.1:9088） | 引入轻量服务发现 + 模型注册 + 配置/灰度开关 |
+> M5 时期的 Python 参照实现差距评估（G1~G14，落点=`onetrans/serving/*.py`）已随基线切换归档：其已修复项（元数据固化/append CAS/路由统一/miss 降级/PS 哈希统一等）由 C++ 主线重新实现并经 golden 对拍承接，逐条处置映射见 [gap_analysis.md](./gap_analysis.md) 第三部分。
 
 ---
 

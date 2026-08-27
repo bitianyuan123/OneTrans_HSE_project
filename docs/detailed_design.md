@@ -685,29 +685,29 @@ C1 ─submit(r1)─┐                      ┌─submit(r2) C2          submit(
 
 ### 7.4 线程与并发模型（C++ 编排 + Python/CUDA 计算，混合架构）
 
-> 本节为**生产实现的目标线程模型**。核心决策：**编排层全 C++ + 标准库有界线程池**（避免 GIL 限制多线程）；**Stage I 计算用 C++ CPU**（计算量低，延迟敏感度低）；**Stage II 计算用 Python/PyTorch CUDA 下发 GPU 算子**（交叉注意力计算量高，需 GPU 并行）。两阶段通过 UserKV 二进制序列化对接。
+> 本节为**生产实现的目标线程模型**。核心决策：**编排层全 C++ + folly 功能分池**（避免 GIL 限制多线程）；**Stage I 计算用 C++ CPU**（计算量低，延迟敏感度低）；**Stage II 计算用 Python/PyTorch CUDA 下发 GPU 算子**（交叉注意力计算量高，需 GPU 并行）。两阶段通过 UserKV 二进制序列化对接。
 
-> **关于线程池实现的约定**：本工程**不引入 folly**。编排层只用到「固定线程数 + 有界 FIFO + 满时快速失败」这一最小能力集，标准库 `std::thread` + `std::deque` 足以承载（见 `cpp/src/common/executor.h`）；引入 folly 会拖入 gflags/glog/double-conversion 等一串依赖与更长的编译时间，而收益有限。folly 的 MPMC 队列、CPU 绑定执行器、fiber 等高级能力当前用不到；若未来确有需要，再以「引入 folly」整体替换，而非自建一个「对照 folly 的等价物」。接入层若需协程化 IO，走 brpc 的 bthread（`deploy/ps` 已采用），同样无需 folly。
+> **关于线程池实现的约定**：本工程**直接引入真实 folly**（`CPUThreadPoolExecutor`/`IOThreadPoolExecutor`，[cpp/src/common/executor.cpp](../cpp/src/common/executor.cpp) 薄封装），不自研、也不维护任何「对照 folly 的等价轮子」。理由：池实现（线程生命周期、队列、优雅停机、观测钩子）属易错基础设施，重复造轮子的维护成本高于引入成本；功能分池（IO/CPU 分类）与有界背压（`ExecutorOverloaded` 快速失败）在 folly 执行器之上以薄封装实现，语义清晰可控。接入层若需协程化 IO，走 brpc 的 bthread（`deploy/ps` 已采用），同样无需在 folly 之上再叠一层。
 
 #### 7.4.1 架构总则：为什么是混合架构
 
 | 阶段 | 计算量 | 语言/设备 | 理由 |
 |---|---|---|---|
 | Stage I（`encode_s` nearline prefill） | 低（单用户、S 序列逐层编码，每用户只做一次） | **C++ CPU** | 计算量不值得占用 GPU；nearline 对延迟不敏感；C++ 实现已对拍通过（24/24 PASS） |
-| Stage II 编排（lookup/encode_ns/KV mget/batch） | 轻 I/O + 轻 CPU | **C++ + 标准库线程池** | 高并发 I/O + 攒批调度，必须 C++ 避免 GIL 阻塞多线程并发 |
+| Stage II 编排（lookup/encode_ns/KV mget/batch） | 轻 I/O + 轻 CPU | **C++ + folly 线程池** | 高并发 I/O + 攒批调度，必须 C++ 避免 GIL 阻塞多线程并发 |
 | Stage II 计算（`score_ns` 交叉注意力） | 高（B×Ns×(S+Ns)×L 层注意力 + FFN） | **Python PyTorch CUDA** | GPU 并行收益巨大；PyTorch 生态成熟，算子下发开发效率高 |
 
-**GIL 边界控制**：Python 只出现在 Stage II 的最终计算调用（`score_ns_batch`），由**单一专用线程**持有 GIL 执行。所有编排（接入、查表、KV 读写、前端编码、攒批调度、结果回填）在 C++ 标准库线程池中运行，**不触碰 GIL**。PyTorch CUDA kernel 执行时会自动释放 GIL（`cudaDeviceSynchronize` 等同步点），因此 C++ 编排线程不因 Python 计算而阻塞。
+**GIL 边界控制**：Python 只出现在 Stage II 的最终计算调用（`score_ns_batch`），由**单一专用线程**持有 GIL 执行。所有编排（接入、查表、KV 读写、前端编码、攒批调度、结果回填）在 C++ folly 线程池中运行，**不触碰 GIL**。PyTorch CUDA kernel 执行时会自动释放 GIL（`cudaDeviceSynchronize` 等同步点），因此 C++ 编排线程不因 Python 计算而阻塞。
 
-#### 7.4.2 线程池清单（功能分池，标准库执行器 + Python 计算桥）
+#### 7.4.2 线程池清单（功能分池，folly 执行器 + Python 计算桥）
 
 | 池 | 类型 | 线程数 | 职责 | **不做什么** |
 |---|---|---|---|---|
 | Ingress Pool | brpc bthread（M:N） | ≥核数 | accept、read body、JSON 反序列化、提交下游、收结果后序列化 | 不查表 / 不读写 KV / 不前向 / 不调 Python |
-| EmbedLookup Pool | `ThreadPoolExecutor`（IO） | 4~8 | item/user/artist/album 四表查表（PS 网络 I/O） | 不做 MLP / 不前向 / 不调 Python |
-| Frontend Encode Pool | `ThreadPoolExecutor`（CPU） | 2~4 | dense 分箱 + MLP + pos + RMSNorm → `s_emb`/`ns_emb` | 不查表 / 不读写 KV / 不做注意力 / 不调 Python |
-| KV I/O Pool | `ThreadPoolExecutor`（IO） | 4~8 | UserKV 的 set/get/mget（datasystem 存储，网络 I/O） | 不前向 / 不查 embedding / 不调 Python |
-| Stage I Compute | `ThreadPoolExecutor`（CPU） | 2~4 | `encode_s`（C++ CPU backbone prefill）→ UserKV | 不查表 / 不读写远端 KV / 不调 Python |
+| EmbedLookup Pool | `folly::IOThreadPoolExecutor` | 4~8 | item/user/artist/album 四表查表（PS 网络 I/O） | 不做 MLP / 不前向 / 不调 Python |
+| Frontend Encode Pool | `folly::CPUThreadPoolExecutor` | 2~4 | dense 分箱 + MLP + pos + RMSNorm → `s_emb`/`ns_emb` | 不查表 / 不读写 KV / 不做注意力 / 不调 Python |
+| KV I/O Pool | `folly::IOThreadPoolExecutor` | 4~8 | UserKV 的 set/get/mget（datasystem 存储，网络 I/O） | 不前向 / 不查 embedding / 不调 Python |
+| Stage I Compute | `folly::CPUThreadPoolExecutor` | 2~4 | `encode_s`（C++ CPU backbone prefill）→ UserKV | 不查表 / 不读写远端 KV / 不调 Python |
 | BatchScheduler | C++ 独立线程 | 1 | 攒批：多请求聚合为 batch，投递给 Python 计算桥 | 不做计算 / 不调 Python（只投递） |
 | Python Compute Bridge | 专用线程（持 GIL） | **1** | 接收 batch → H2D 拷贝 → `score_ns_batch`(PyTorch CUDA) → D2H 回传 logits | 不查表 / 不读写 KV / 不做编排 |
 | Metrics/Timer | 单独 | 1 | 周期 flush 指标、TTL sweep、直方图快照 | 不在请求热路径 |
@@ -754,8 +754,8 @@ brpc bthread (Ingress)
 
 **阶段顺序**：`Lookup(IO) → Encode_NS(CPU) → KV_mget(IO) → Batch(C++调度) → Score_ns(Python/CUDA) → 回填(C++)`
 
-- Lookup 与 KV_mget 是 I/O，在 IO 线程池（`ThreadPoolExecutor`）上运行；
-- Encode_NS 是轻 CPU，在 CPU 线程池（`ThreadPoolExecutor`）上运行；
+- Lookup 与 KV_mget 是 I/O，在 IO 线程池（`folly::IOThreadPoolExecutor`）上运行；
+- Encode_NS 是轻 CPU，在 CPU 线程池（`folly::CPUThreadPoolExecutor`）上运行；
 - 攒批在 C++ BatchScheduler（独立线程，不持 GIL）；
 - **唯一持 GIL 的点**是 Python Compute Bridge，接收已攒好的 batch 做一次 CUDA 前向；
 - 结果回填与 JSON 序列化回到 C++ Ingress。
@@ -906,7 +906,7 @@ Stage II 非自回归（M 候选整批并行、单次前向出全部分数），
 | folly 阶段串联 | [common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) + SEDA 阶段链 | **已实现**（真实 folly `CPUThreadPoolExecutor`/`IOThreadPoolExecutor` 功能分池 + 有界背压 `ExecutorOverloaded` 快速失败） |
 | datasystem adapter | [kv/datasystem_store.cpp](file:///workspace/cpp/src/kv/datasystem_store.cpp) DatasystemKVStore | **已实现**（调 datasystem C++ SDK `KVClient` `Set/Get/Del/Expire`；`ONETRANS_WITH_DATASYSTEM` 条件编译，缺失回退 LocalKVStore） |
 
-**演进路径**：① ~~引入 folly 分池与 Future 串联（编排 C++ 化）~~ **已完成**（`Executor`/`ThreadPoolExecutor`/`ExecutorSet` + `ScoreFlow` SEDA 阶段链）；② 接入 datasystem（KV 外置）——**已完成**（`DatasystemKVStore` 调 datasystem C++ SDK，`LocalKVStore` 回退）；③ ~~新增 Python Compute Bridge（Stage II 计算换 CUDA）~~ **已完成**（`--compute-backend auto|python|cpp`，`auto` 优先 python、失败/队列满降级 cpp）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
+**演进路径**：① ~~引入 folly 分池与 Future 串联（编排 C++ 化）~~ **已完成**（真实 folly `CPUThreadPoolExecutor`/`IOThreadPoolExecutor` + `ScoreFlow` SEDA 阶段链）；② 接入 datasystem（KV 外置）——**已完成**（`DatasystemKVStore` 调 datasystem C++ SDK，`LocalKVStore` 回退；集群联调见 [gap_analysis.md](./gap_analysis.md) D3）；③ ~~新增 Python Compute Bridge（Stage II 计算换 CUDA）~~ **已完成**（`--compute-backend auto|python|cpp`，`auto` 优先 python、失败/队列满降级 cpp）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
 
 ### 7.5 关键数据结构
 
@@ -1159,7 +1159,7 @@ raw_bytes = concat(K_s^0, V_s^0, K_s^1, V_s^1, ..., K_s^{L-1}, V_s^{L-1})   # �
 本文到此为止均为**目标设计**。各组件/各层的落地状态、实测结果、差距分级与推进路线**一律**见：
 
 - [implementation_status.md](./implementation_status.md)——已实现与验证内容、分层落地状态、验证结果摘录；
-- [gap_analysis.md](./gap_analysis.md)——差距清单（编号 G1~G14）、必要性分析与里程碑路线图。
+- [gap_analysis.md](./gap_analysis.md)——差距清单（设计↔C++ 实现逐条核对，编号 D1~D9；含旧 G1~G14 处置映射）、必要性分析与里程碑路线图。
 
 ---
 
