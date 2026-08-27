@@ -2,7 +2,7 @@
 
 > 版本：v0.5（五次修订：文档三分体系确立，吸收原《工程级详细设计》的「现状+缺口」内容）
 > 分支：`feat/onetrans-e2e-serving`
-> 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；模型层见 [model_design.md](./model_design.md)；端到端设计（原《工程级详细设计》设计内容已并入）见 [detailed_design.md](./detailed_design.md)。
+> 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段（工程可用）执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计（原《工程级详细设计》设计内容已并入）见 [detailed_design.md](./detailed_design.md)。
 
 ---
 

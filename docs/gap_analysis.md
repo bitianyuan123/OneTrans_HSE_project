@@ -495,6 +495,8 @@ class ModelRelease:
 
 ### 4.1 里程碑（继承 `detailed_design.md` §8，新增 M5~M8）
 
+> M6/M7/G13 已收敛为**第二阶段（工程可用）执行设计**（T0~T5 轨制，含模块级/接口级设计与验收），见 [phase2_design.md](./phase2_design.md)；本节保留里程碑总览。
+
 | 里程碑 | 内容 | 出口 / 验收标准 | 依赖 |
 |---|---|---|---|
 | M0 | pyramid 方向修正 + 单卡数值基准 | 单前向 vs 两阶段 max\|diff\| < ε（已达成） | — |

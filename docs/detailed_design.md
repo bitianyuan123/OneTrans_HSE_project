@@ -16,7 +16,7 @@
 |---|---|---|
 | ① 模型层 | [model_design.md](./model_design.md) | 模型结构、计算逻辑、训练、两阶段等价性、正确性验证方法学 |
 | ② 端到端设计 | [e2e_design_spec.md](./e2e_design_spec.md)（概要）+ **本文**（详细） | 只依据设计意图的系统设计：架构/数据流/线程模型/契约 |
-| ③ 现状 & 差距 | [implementation_status.md](./implementation_status.md) + [gap_analysis.md](./gap_analysis.md) | 已实现/未实现、实测结果、差距分级与路线图 |
+| ③ 现状 & 差距 | [implementation_status.md](./implementation_status.md) + [gap_analysis.md](./gap_analysis.md) + [phase2_design.md](./phase2_design.md) | 已实现/未实现、实测结果、差距分级与路线图、阶段执行设计 |
 
 | 读者 | 关注章节 |
 |---|---|
@@ -1088,3 +1088,4 @@ raw_bytes = concat(K_s^0, V_s^0, K_s^1, V_s^1, ..., K_s^{L-1}, V_s^{L-1})   # �
 | ② 端到端设计（详细） | **本文** | 全量系统设计 |
 | ③ 现状 & 差距 | [implementation_status.md](./implementation_status.md) | 本文各组件的落地状态与实测 |
 | ③ 现状 & 差距 | [gap_analysis.md](./gap_analysis.md) | 差距分级、必要性分析与路线图 |
+| ③ 现状 & 差距 | [phase2_design.md](./phase2_design.md) | 第二阶段（工程可用）执行设计：本文 §7.8 等设计意图的落地轨制 |
