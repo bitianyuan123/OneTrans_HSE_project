@@ -9,7 +9,8 @@ namespace onetrans {
 
 namespace {
 
-constexpr char kMagic[] = "ONETRANSKV\x01";  // 12 字节（含 \0 结尾共 12 个字符位）
+constexpr char kMagic[] = "ONETRANSKV\x01";  // 与 Python _MAGIC 严格一致：11 字节（不含 \0）
+constexpr size_t kMagicLen = 11;
 
 struct ParsedHeader {
     JsonValue header;
@@ -23,15 +24,15 @@ size_t tensor_bytes(const std::vector<int64_t>& shape) {
 }
 
 ParsedHeader parse_header(const std::string& payload) {
-    if (payload.size() < 12 || std::memcmp(payload.data(), kMagic, 12) != 0)
+    if (payload.size() < kMagicLen || std::memcmp(payload.data(), kMagic, kMagicLen) != 0)
         throw std::runtime_error("未知 payload 魔数");
     uint32_t hlen;
-    std::memcpy(&hlen, payload.data() + 12, 4);  // 小端
-    if (payload.size() < 12 + 4 + hlen)
+    std::memcpy(&hlen, payload.data() + kMagicLen, 4);  // 小端
+    if (payload.size() < kMagicLen + 4 + hlen)
         throw std::runtime_error("payload header 截断");
     ParsedHeader out;
-    out.header = json_parse(payload.substr(16, hlen));
-    out.body_offset = 12 + 4 + hlen;
+    out.header = json_parse(payload.substr(kMagicLen + 4, hlen));
+    out.body_offset = kMagicLen + 4 + hlen;
     return out;
 }
 
@@ -61,8 +62,8 @@ std::string kv_serialize(const UserKV& kv) {
     std::string header_json = header.dump();
 
     std::string payload;
-    payload.reserve(16 + header_json.size() + total * sizeof(float));
-    payload.append(kMagic, 12);
+    payload.reserve(kMagicLen + 4 + header_json.size() + total * sizeof(float));
+    payload.append(kMagic, kMagicLen);
     uint32_t hlen = static_cast<uint32_t>(header_json.size());
     payload.append(reinterpret_cast<const char*>(&hlen), 4);
     payload.append(header_json);
@@ -184,7 +185,7 @@ std::string kv_concat_payload(const std::string& base, const std::string& delta)
     std::string header_json = header.dump();
 
     std::string payload;
-    payload.append(kMagic, 12);
+    payload.append(kMagic, kMagicLen);
     uint32_t hlen = static_cast<uint32_t>(header_json.size());
     payload.append(reinterpret_cast<const char*>(&hlen), 4);
     payload.append(header_json);

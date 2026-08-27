@@ -21,6 +21,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 set(CORE_SOURCES
+    src/common/executor.cpp
     src/common/json.cpp
     src/common/sha256.cpp
     src/common/tensor.cpp
@@ -31,7 +32,9 @@ set(CORE_SOURCES
     src/kv/serialize.cpp
     src/kv/store.cpp
     src/net/http_server.cpp
+    src/serving/compute_bridge.cpp
     src/serving/embed_lookup.cpp
+    src/serving/flow.cpp
     src/serving/json_io.cpp
     src/serving/pipeline.cpp
 )
@@ -39,6 +42,30 @@ set(CORE_SOURCES
 add_library(onetrans_core STATIC ${CORE_SOURCES})
 find_package(Threads REQUIRED)
 target_link_libraries(onetrans_core PUBLIC Threads::Threads)
+
+# ---- Python 计算桥（可选，§7.4.5）：嵌入解释器下发 PyTorch 算子 ---- #
+# ONETRANS_PYTHON_BRIDGE=ON 且找到 Python3 Development 时启用；
+# 否则编译为降级桩（available()==false，Stage II 走 C++ CPU）。
+option(ONETRANS_PYTHON_BRIDGE "嵌入 Python 计算桥（Stage II → PyTorch）" ON)
+if(ONETRANS_PYTHON_BRIDGE)
+    # 优先用当前 PATH 里的 python3（与 torch 安装解释器一致），
+    # 可 -DPython3_EXECUTABLE=... 显式覆盖
+    if(NOT Python3_EXECUTABLE)
+        execute_process(COMMAND python3 -c "import sys; print(sys.executable)"
+                        OUTPUT_VARIABLE _PY_EXE OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_PY_EXE)
+            set(Python3_EXECUTABLE ${_PY_EXE})
+        endif()
+    endif()
+    find_package(Python3 COMPONENTS Interpreter Development)
+    if(Python3_Development_FOUND)
+        message(STATUS "python bridge: ${Python3_EXECUTABLE} (${Python3_VERSION})")
+        target_compile_definitions(onetrans_core PUBLIC ONETRANS_WITH_PYTHON=1)
+        target_link_libraries(onetrans_core PUBLIC Python3::Python)
+    else()
+        message(STATUS "python bridge: 未找到 Python3 Development（降级 C++ CPU）")
+    endif()
+endif()
 
 add_executable(onetrans_server tools/server_main.cpp)
 target_link_libraries(onetrans_server PRIVATE onetrans_core)

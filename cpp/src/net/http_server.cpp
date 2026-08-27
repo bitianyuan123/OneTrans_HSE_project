@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -118,6 +119,11 @@ void HttpServer::route(const std::string& method, const std::string& path, HttpH
     routes_[method + " " + path] = std::move(handler);
 }
 
+void HttpServer::route_async(const std::string& method, const std::string& path,
+                             AsyncHandler handler) {
+    async_routes_[method + " " + path] = std::move(handler);
+}
+
 void HttpServer::run() {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() 失败");
@@ -174,6 +180,9 @@ void HttpServer::stop() {
         if (t.joinable()) t.join();
     }
     threads_.clear();
+    // drain 在途异步请求（完成线程会写回并关闭 fd；上限 10s 防御性退出）
+    for (int i = 0; i < 10000 && pending_async_.load() > 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 // 读到 "\r\n\r\n" 为止（请求头），继续读 Content-Length 字节 body
@@ -239,6 +248,17 @@ bool HttpServer::read_request(int fd, HttpRequest& req, std::string& raw_head) {
     return true;
 }
 
+void HttpServer::write_response(int fd, const HttpResponse& resp) {
+    std::string head = "HTTP/1.1 " + std::to_string(resp.status) + " " + status_text(resp.status) +
+                       "\r\nContent-Type: " + resp.content_type +
+                       "\r\nContent-Length: " + std::to_string(resp.body.size()) +
+                       "\r\nConnection: close\r\n\r\n";
+    ::send(fd, head.data(), head.size(), MSG_NOSIGNAL);
+    if (!resp.body.empty()) ::send(fd, resp.body.data(), resp.body.size(), MSG_NOSIGNAL);
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+}
+
 void HttpServer::handle_connection(int fd) {
     HttpRequest req;
     std::string raw_head;
@@ -247,8 +267,31 @@ void HttpServer::handle_connection(int fd) {
         return;
     }
 
+    const std::string key = req.method + " " + req.path;
+
+    // 异步路由：接入线程提交后立即返回（不占 worker 等待计算，§7.4.3 接入边界）；
+    // 响应由流水线完成线程经 done 写回。done 单次生效（原子标记防重复写）。
+    auto ait = async_routes_.find(key);
+    if (ait != async_routes_.end()) {
+        pending_async_.fetch_add(1);
+        auto done = [this, fd, called = std::make_shared<std::atomic<bool>>(false)](
+                        HttpResponse resp) {
+            if (called->exchange(true)) return;  // 幂等：只写一次
+            write_response(fd, resp);
+            pending_async_.fetch_sub(1);
+        };
+        try {
+            ait->second(req, done);
+        } catch (const std::exception& e) {
+            done(HttpResponse::json(500, std::string("{\"error\":\"") + e.what() + "\"}"));
+        } catch (...) {
+            done(HttpResponse::json(500, "{\"error\":\"unknown\"}"));
+        }
+        return;  // worker 立即处理下一连接
+    }
+
     HttpResponse resp;
-    auto it = routes_.find(req.method + " " + req.path);
+    auto it = routes_.find(key);
     if (it != routes_.end()) {
         try {
             resp = it->second(req);
@@ -258,23 +301,19 @@ void HttpServer::handle_connection(int fd) {
             resp = HttpResponse::json(500, "{\"error\":\"unknown\"}");
         }
     } else {
-        // 存在路径但方法不符 → 405
+        // 存在路径但方法不符 → 405（同步与异步路由都算路径存在）
         bool path_exists = false;
         for (const auto& [k, h] : routes_) {
+            if (k.substr(k.find(' ') + 1) == req.path) path_exists = true;
+        }
+        for (const auto& [k, h] : async_routes_) {
             if (k.substr(k.find(' ') + 1) == req.path) path_exists = true;
         }
         resp = path_exists ? HttpResponse::json(405, "{\"error\":\"method not allowed\"}")
                            : HttpResponse::json(404, "{\"error\":\"not found\"}");
     }
 
-    std::string head = "HTTP/1.1 " + std::to_string(resp.status) + " " + status_text(resp.status) +
-                       "\r\nContent-Type: " + resp.content_type +
-                       "\r\nContent-Length: " + std::to_string(resp.body.size()) +
-                       "\r\nConnection: close\r\n\r\n";
-    ::send(fd, head.data(), head.size(), MSG_NOSIGNAL);
-    if (!resp.body.empty()) ::send(fd, resp.body.data(), resp.body.size(), MSG_NOSIGNAL);
-    ::shutdown(fd, SHUT_RDWR);
-    ::close(fd);
+    write_response(fd, resp);
 }
 
 }  // namespace onetrans

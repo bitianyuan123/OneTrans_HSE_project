@@ -118,54 +118,37 @@ std::pair<Tensor, Tensor> EmbeddingFrontend::encode_s(const std::vector<int64_t>
     return {s_emb, s_mask};
 }
 
-Tensor EmbeddingFrontend::encode_ns(const ScoreInput& in, const LookupFn& lookup) const {
+// ---- 两步式（SEDA，§7.4.3）----------------------------------------------- //
+// 阶段 1（EmbedLookup Pool）：查表 + mean-bag 聚合（阻塞 I/O 归 IO 池）
+NsEmbeddings EmbeddingFrontend::lookup_ns(const ScoreInput& in, const LookupFn& lookup) const {
+    if (in.candidates.empty()) throw std::runtime_error("score: candidates 为空");
     const int M = static_cast<int>(in.candidates.size());
-    if (M == 0) throw std::runtime_error("score: candidates 为空");
     const int D = cfg_.d_model;
-    const int Ns = static_cast<int>(cfg_.ns_group_dims.size());
-    const float eps = static_cast<float>(cfg_.rms_eps);
 
-    // dense：用户级 ∥ 候选级 → piecewise
-    const int nf = cfg_.piecewise_n_features;
-    std::vector<float> dense(static_cast<size_t>(M * nf));
-    for (int m = 0; m < M; ++m) {
-        const auto& c = in.candidates[m];
-        if (in.user_dense.size() != static_cast<size_t>(cfg_.n_user_dense) ||
-            c.dense.size() != static_cast<size_t>(cfg_.n_cand_dense))
-            throw std::runtime_error("dense 列数不匹配");
-        std::copy(in.user_dense.begin(), in.user_dense.end(),
-                  dense.begin() + static_cast<long>(m * nf));
-        std::copy(c.dense.begin(), c.dense.end(),
-                  dense.begin() + static_cast<long>(m * nf + cfg_.n_user_dense));
-    }
-    Tensor dense_enc = piecewise_forward(pw_w, pw_b, cfg_.piecewise_n_bins, dense.data(), M, nf);
+    NsEmbeddings emb;
+    emb.uid = lookup("user", {in.uid_sparse});
 
-    // uid 查表（同一 user 广播 M 行）
-    std::vector<float> uid_row = lookup("user", {in.uid_sparse});
-    std::vector<float> uid_emb(static_cast<size_t>(M) * D);
-    for (int m = 0; m < M; ++m)
-        std::copy(uid_row.begin(), uid_row.end(), uid_emb.begin() + static_cast<long>(m * D));
-    // item 查表
     std::vector<int64_t> item_ids;
-    item_ids.reserve(M);
+    item_ids.reserve(in.candidates.size());
     for (const auto& c : in.candidates) item_ids.push_back(c.item_id);
-    std::vector<float> item_emb = lookup("item", item_ids);
+    emb.items = lookup("item", item_ids);
 
     // mean-bag（artist/album）：多值查表求均值，空 bag → 0
     auto bag = [&](const std::string& table,
                    const std::vector<std::vector<int64_t>>& ids_per) -> std::vector<float> {
         std::vector<int64_t> flat;
         for (const auto& v : ids_per) flat.insert(flat.end(), v.begin(), v.end());
-        std::vector<float> emb = flat.empty() ? std::vector<float>(D, 0.0f) : lookup(table, flat);
-        std::vector<float> out(static_cast<size_t>(M * D), 0.0f);
+        std::vector<float> rows =
+            flat.empty() ? std::vector<float>(D, 0.0f) : lookup(table, flat);
+        std::vector<float> out(static_cast<size_t>(M) * D, 0.0f);
         size_t off = 0;
         for (int m = 0; m < M; ++m) {
-            size_t n = ids_per[m].size();
+            size_t n = ids_per[static_cast<size_t>(m)].size();
             if (n == 0) continue;
             for (int t = 0; t < D; ++t) {
                 float acc = 0.0f;
-                for (size_t r = 0; r < n; ++r) acc += emb[(off + r) * D + t];
-                out[m * D + t] = acc / static_cast<float>(n);
+                for (size_t r = 0; r < n; ++r) acc += rows[(off + r) * D + t];
+                out[static_cast<size_t>(m) * D + t] = acc / static_cast<float>(n);
             }
             off += n;
         }
@@ -176,13 +159,43 @@ Tensor EmbeddingFrontend::encode_ns(const ScoreInput& in, const LookupFn& lookup
         artist_ids.push_back(c.artist_ids);
         album_ids.push_back(c.album_ids);
     }
-    std::vector<float> artist_emb = bag("artist", artist_ids);
-    std::vector<float> album_emb = bag("album", album_ids);
+    emb.artists = bag("artist", artist_ids);
+    emb.albums = bag("album", album_ids);
+    return emb;
+}
+
+// 阶段 2（Frontend Encode Pool）：piecewise + 组 MLP + RMSNorm（纯 CPU 计算）
+Tensor EmbeddingFrontend::encode_ns_with(const ScoreInput& in, const NsEmbeddings& emb) const {
+    const int M = static_cast<int>(in.candidates.size());
+    const int D = cfg_.d_model;
+    const int Ns = static_cast<int>(cfg_.ns_group_dims.size());
+    const float eps = static_cast<float>(cfg_.rms_eps);
+
+    // dense：用户级 ∥ 候选级 → piecewise
+    const int nf = cfg_.piecewise_n_features;
+    std::vector<float> dense(static_cast<size_t>(M * nf));
+    for (int m = 0; m < M; ++m) {
+        const auto& c = in.candidates[static_cast<size_t>(m)];
+        if (in.user_dense.size() != static_cast<size_t>(cfg_.n_user_dense) ||
+            c.dense.size() != static_cast<size_t>(cfg_.n_cand_dense))
+            throw std::runtime_error("dense 列数不匹配");
+        std::copy(in.user_dense.begin(), in.user_dense.end(),
+                  dense.begin() + static_cast<long>(m * nf));
+        std::copy(c.dense.begin(), c.dense.end(),
+                  dense.begin() + static_cast<long>(m * nf + cfg_.n_user_dense));
+    }
+    Tensor dense_enc = piecewise_forward(pw_w, pw_b, cfg_.piecewise_n_bins, dense.data(), M, nf);
+
+    // uid 广播 M 行
+    if (emb.uid.size() != static_cast<size_t>(D)) throw std::runtime_error("uid 表维度不匹配");
+    std::vector<float> uid_emb(static_cast<size_t>(M) * D);
+    for (int m = 0; m < M; ++m)
+        std::copy(emb.uid.begin(), emb.uid.end(), uid_emb.begin() + static_cast<long>(m * D));
 
     // NSGroupWise：各组 mlp → stack [M, Ns, D] → RMSNorm
     Tensor ns_emb({M, Ns, D});
-    std::vector<const std::vector<float>*> groups = {&dense_enc.data, &uid_emb, &item_emb,
-                                                      &artist_emb, &album_emb};
+    std::vector<const std::vector<float>*> groups = {&dense_enc.data, &uid_emb, &emb.items,
+                                                      &emb.artists, &emb.albums};
     std::vector<float> stacked(static_cast<size_t>(M * Ns * D));
     std::vector<float> g_tmp(static_cast<size_t>(M) * D);
     for (size_t g = 0; g < cfg_.ns_group_dims.size(); ++g) {
@@ -197,6 +210,12 @@ Tensor EmbeddingFrontend::encode_ns(const ScoreInput& in, const LookupFn& lookup
     }
     rms_norm_rows(stacked.data(), tok_rms_g.data.data(), ns_emb.data.data(), M * Ns, D, eps);
     return ns_emb;
+}
+
+// 一步式 = 两步式组合（兼容路径）
+Tensor EmbeddingFrontend::encode_ns(const ScoreInput& in, const LookupFn& lookup) const {
+    NsEmbeddings emb = lookup_ns(in, lookup);
+    return encode_ns_with(in, emb);
 }
 
 }  // namespace onetrans

@@ -42,6 +42,15 @@ struct IngestInput {
 // 查表函数：表名（item/user/artist/album）+ id 列表 → fp32 平铺 [N * d_model]
 using LookupFn = std::function<std::vector<float>(const std::string&, const std::vector<int64_t>&)>;
 
+// NS 侧查表预取结果（EmbedLookup Pool 产出 → Frontend Encode Pool 消费的契约，
+// §7.4.3 阶段边界数据结构；bag 聚合属查表侧，在 lookup 阶段完成）
+struct NsEmbeddings {
+    std::vector<float> uid;     // [D]（单行，encode 时广播 M 份）
+    std::vector<float> items;   // [M * D]
+    std::vector<float> artists;  // [M * D]（mean-bag 已聚合）
+    std::vector<float> albums;   // [M * D]（mean-bag 已聚合）
+};
+
 class EmbeddingFrontend {
 public:
     static EmbeddingFrontend load(const ArtifactStore& store);
@@ -49,8 +58,14 @@ public:
     // → (s_emb [1, max_seq_len, D], s_mask [1, max_seq_len] 0/1)
     std::pair<Tensor, Tensor> encode_s(const std::vector<int64_t>& item_ids,
                                        const LookupFn& lookup) const;
-    // → ns_emb [M, Ns, D]
+    // → ns_emb [M, Ns, D]（lookup + encode 一步式：nearline/兼容路径）
     Tensor encode_ns(const ScoreInput& in, const LookupFn& lookup) const;
+
+    // 两步式（SEDA，§7.4.3）：
+    // 阶段 1（EmbedLookup Pool）：查表 + mean-bag 聚合
+    NsEmbeddings lookup_ns(const ScoreInput& in, const LookupFn& lookup) const;
+    // 阶段 2（Frontend Encode Pool）：piecewise + 组 MLP + RMSNorm → ns_emb [M, Ns, D]
+    Tensor encode_ns_with(const ScoreInput& in, const NsEmbeddings& emb) const;
 
     const ArtifactConfig& config() const { return cfg_; }
 

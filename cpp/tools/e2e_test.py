@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """端到端 HTTP 测试：启动 onetrans_server → ingest → score → 与 golden 对拍。
 
-覆盖（对应设计文档 §4 接入层 + §3 两阶段编排）：
-1. GET  /healthz                 存活探测
+覆盖（对应设计文档 §4 接入层 + §7.4 SEDA 编排 + 混合计算后端）：
+1. GET  /healthz                 存活探测（断言生效计算后端）
 2. POST /ingest                  Stage I：cases/ingest_case.json → accepted + checksum
 3. POST /score                   Stage II：cases/score_case.json → logits 对拍 golden（<1e-5）
 4. POST /score（未 ingest 用户） KV miss 降级：全零 logits + kv_hit=false（G8 语义）
-5. GET  /metrics                 指标暴露
-6. 404/405 路由行为
+5. 并发 32 路异步 score           SEDA 流水线 + 异步接入（全部 200 + hit 行对拍）
+6. GET  /metrics                 指标暴露（flow.backend.* 计数）
+7. 404/405 路由行为
 
 运行：python cpp/tools/e2e_test.py [--server PATH] [--weights DIR] [--golden DIR]
+                                     [--backend auto|python|cpp]
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -42,7 +45,7 @@ def http(method: str, url: str, body: bytes | None = None) -> tuple[int, str]:
         return e.code, e.read().decode("utf-8")
 
 
-def wait_ready(port: int, timeout: float = 10.0) -> bool:
+def wait_ready(port: int, timeout: float = 120.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -51,7 +54,7 @@ def wait_ready(port: int, timeout: float = 10.0) -> bool:
                 return True
         except Exception:
             pass
-        time.sleep(0.1)
+        time.sleep(0.2)
     return False
 
 
@@ -72,6 +75,7 @@ def main() -> int:
     ap.add_argument("--weights", type=Path, default=root / "cpp/artifacts/weights")
     ap.add_argument("--golden", type=Path, default=root / "cpp/artifacts/golden")
     ap.add_argument("--port", type=int, default=None)
+    ap.add_argument("--backend", choices=["auto", "python", "cpp"], default="auto")
     args = ap.parse_args()
 
     if not args.server.exists():
@@ -86,6 +90,7 @@ def main() -> int:
             "--host", "127.0.0.1",
             "--port", str(port),
             "--model-version", "v42",
+            "--compute-backend", args.backend,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -105,9 +110,17 @@ def main() -> int:
             return 1
         base = f"http://127.0.0.1:{port}"
 
-        # 1. healthz
+        # 1. healthz（含生效计算后端断言）
         code, body = http("GET", f"{base}/healthz")
-        check("healthz", code == 200 and json.loads(body)["status"] == "ok")
+        backend = json.loads(body).get("compute_backend", "?")
+        expect_backend = "cpp" if args.backend == "cpp" else "python"
+        check(
+            "healthz",
+            code == 200
+            and json.loads(body)["status"] == "ok"
+            and backend == expect_backend,
+            f"compute_backend={backend} (want {expect_backend})",
+        )
 
         # 2. ingest（Stage I）
         ingest_body = (args.golden / "cases/ingest_case.json").read_bytes()
@@ -141,11 +154,42 @@ def main() -> int:
         zeros = all(abs(v) == 0.0 for row in j.get("logits", [[1]]) for v in row)
         check("score/kv_miss_degrade", code == 200 and not j["kv_hit"] and zeros)
 
-        # 5. metrics
-        code, body = http("GET", f"{base}/metrics")
-        check("metrics", code == 200 and "kv.hit" in body and "online.qps" in body)
+        # 5. 并发 32 路：异步接入 + SEDA 流水线（hit/miss 混合；hit 行与 golden 对拍）
+        def one_score(i: int) -> tuple[int, dict]:
+            b = json.loads(score_body)
+            if i % 2:
+                b["user_id"] = f"user-rand-{i}"  # miss 路径
+            c, body2 = http("POST", f"{base}/score", json.dumps(b).encode())
+            return c, json.loads(body2)
 
-        # 6. 路由行为
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            results = list(ex.map(one_score, range(32)))
+        all_200 = all(c == 200 for c, _ in results)
+        hit_ok = all(
+            abs(g - w) <= 1e-5
+            for _, j2 in results[::2]  # 偶数下标 = hit 行
+            for gr, wr in zip(j2["logits"], want)
+            for g, w in zip(gr, wr)
+        )
+        check(
+            "score/concurrent_32",
+            all_200 and hit_ok,
+            f"32 reqs, all_200={all_200}, hit_rows_match_golden={hit_ok}",
+        )
+
+        # 6. metrics（含计算后端路径计数：flow.backend.python / flow.backend.cpp）
+        code, body = http("GET", f"{base}/metrics")
+        backend_metric = f"flow.backend.{backend}"
+        check(
+            "metrics",
+            code == 200
+            and "kv.hit" in body
+            and "online.qps" in body
+            and backend_metric in body,
+            f"backend counter={backend_metric}",
+        )
+
+        # 7. 路由行为
         code, _ = http("GET", f"{base}/nope")
         check("route/404", code == 404)
         code, _ = http("PUT", f"{base}/score")
