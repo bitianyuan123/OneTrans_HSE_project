@@ -1,6 +1,6 @@
 # 剩余差距审视与高优先级项详细设计
 
-> 版本：v0.1
+> 版本：v0.2（§7.4 混合架构落地后复核：SEDA 编排 + Python 计算桥已完成，G6 的 C++ 热路径主体已闭环）
 > 上游：
 > - [端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6、三 fabric）
 > - [详细设计](./detailed_design.md)（KV/Tensor/PS 接口契约、架构/线程模型/部署/可靠性/可观测性全量系统设计；原《工程级详细设计》已并入该文档）
@@ -27,7 +27,7 @@
 | G3 | P1 | 一致性/本地性 | 路由哈希三处不统一（KV 分片 jump vs worker 取模 `hash64%n` vs PS Knuth），破坏「KV 与 owner worker 同节点共存」，扩缩容全量 remap | imp §5.1、eng §6.1/§11 | （保留必要性分析，M5 已实现） | **是**（M5） |
 | G4 | P1 | 可靠性 | 无客户端超时、无重试&幂等、无熔断/限流、无健康检查/优雅停机（仅队列背压） | imp §5.2、eng §8/§11 | **P1-High** | 否 |
 | G5 | P1 | 可观测性 | 指标仅进程内存（`ServingMetrics`），无导出/无结构化日志（缺 req_id/trace_id）/无分布式 trace | imp §5.3、eng §9/§11 | P1-Mid | 否 |
-| G6 | P1 | 落地 | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考），混合参数化层未移植 vLLM 自定义 op | imp §5.5、eng §11 | P1-Mid | 否 |
+| G6 | P1 | 落地 | 无 C++ Nearline/Online 热路径 worker（仅 PS 有 C++ 参考），混合参数化层未移植 vLLM 自定义 op | imp §5.5、eng §11 | （复核：主体已实现） | **是**（C++ SEDA 编排 + Python 计算桥；接入层暂为自研 HTTP 而非 brpc，vLLM op 未做） |
 | G7 | P1 | 落地 | tokenizer + 稀疏 embedding 查表未接入 serving 热路径（`ingest`/`score` 直收已 tokenize 的 `s_emb`/`ns_emb`） | imp §5.5、eng §11 | **P1-High** | 否 |
 | G8 | P1 | 可靠性/降级 | KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」「空 KV 快速返回」降级 | imp §5.5、eng §8 | （保留必要性分析，M5 已实现） | **是**（M5） |
 | G9 | P1 | 落地 | 无服务发现 / 模型版本注册中心，PS/datasystem host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | imp §5.5、eng §11 | P1-Mid | 否 |
@@ -52,6 +52,13 @@
 
 - **G10（PS 跨语言分片哈希不等价）**：哈希已统一到 **Knuth 乘法哈希**——`/workspace/deploy/ps/embedding_server.cc` 的 `detail::ShardOf` 为唯一标准，Python 侧 `/workspace/onetrans/serving/embedding_ps_client.py` 的 `ShardedEmbeddingTable.shard_of` 改为同款 Knuth 乘法哈希（复用 `hash64` 不再 `str(id)` 混淆、负 id 语义对齐）。详细设计见代码注释，本文不重复设计。
 - **G11（C++ PS 仅单表）**：`embedding_server.cc` 已从单 `ShardedEmbeddingTable` 改为 `table -> ShardedEmbeddingTable` 多表映射（表注册/淘汰 + 版本），`DoLookup` 按 `req.table()` 路由。详细设计见代码注释，本文不重复设计。
+
+**G6 主体已由 §7.4 混合架构实现（工程主线，v1.2）**：
+
+- **C++ SEDA 编排全链路**：`/workspace/cpp/src/serving/flow.cpp`（lookup→encode→kv→batch→score 阶段链，每阶段独立线程池 + 有界队列背压，folly 语义等价执行器 `/workspace/cpp/src/common/executor.cpp`）；接入层 `route_async` 异步路由（`/workspace/cpp/src/net/http_server.cpp`）。
+- **Python 计算桥（Stage II → PyTorch CUDA/CPU）**：`/workspace/cpp/src/serving/compute_bridge.cpp` 嵌入解释器 + 专用线程持 GIL 下发 `score_batch`（`/workspace/cpp/tools/bridge_score.py`）；队列满/不可用自动降级 C++ `score_ns_batch`（数值等价，双后端 e2e 对拍 golden < 1e-5）。
+- **Stage I 保持 C++ CPU**（`stage1_compute` 池，nearline 全程不触碰 Python），符合 §7.4.1 架构总则。
+- **剩余缺口**：接入层为自研 HTTP（brpc/bthread 待换装）、KV 后端为 LocalKVStore（datasystem adapter 待接）、vLLM 自定义 op（M8c）未做。
 
 本文**第二部分**对 G1/G2/G3/G8/G10/G11 仍保留必要性分析（标注「已处理」），**第三部分**不再为其展开详细设计；**重点对象是 G4~G7、G9 尚未实现的项**。
 
@@ -527,7 +534,15 @@ class ModelRelease:
 
 - G4 / G5（M6 可靠 + 观测）
 - G7 / G9（M7 热路径接线）
-- G6（M8 C++ 移植，分 M8a→M8c）
+- G6 剩余（v1.2 后）：接入层 brpc/bthread 换装、datasystem KV adapter、M8c vLLM 自定义 op
 - G12 ~ G14（P2：redis/HBM 直通、测试框架/CI、局部性能）
+
+**§7.4 混合架构已落地（工程主线 v1.2，本次提交）**
+
+- [x] C++ SEDA 编排：`cpp/src/serving/flow.cpp`（lookup→encode→kv→batch→score，各阶段独立池 + 有界队列 `ExecutorOverloaded` 快速失败）。
+- [x] folly 语义线程池：`cpp/src/common/executor.cpp`（IO/CPU 功能分池，工程环境无 folly 时零依赖等价物）。
+- [x] 异步接入路由：`cpp/src/net/http_server.cpp` `route_async`（提交即释放 worker，完成线程写回响应）。
+- [x] Python 计算桥：`cpp/src/serving/compute_bridge.cpp` + `cpp/tools/bridge_score.py`（嵌入解释器、专用线程持 GIL、PyTorch CUDA/CPU 前向、cap=16 队列满自动降级 C++）。
+- [x] 数值守护：`verify_golden`（24/24）+ `e2e_test --backend cpp|auto|python`（8/8 × 3，python 桥路径 max|diff|=1.49e-07 vs golden；并发 32 路 all-200）。
 
 > 本文档按「设计先行」维护：G1~G3/G8/G10/G11 的落地实现见对应代码文件与 `implementation_status.md` §2；`.cc/.h/.py` 的具体改动不在本文展开。

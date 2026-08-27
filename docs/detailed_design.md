@@ -893,18 +893,18 @@ Stage II 非自回归（M 候选整批并行、单次前向出全部分数），
 
 | 目标阶段 | 当前 `cpp/` 落点 | 状态 |
 |---|---|---|
-| Ingress | [net/http_server](file:///workspace/cpp/src/net/http_server.cpp) accept + worker 池 | 已分离接入与 accept；`/score` 需改异步 |
-| EmbedLookup | [serving/embed_lookup](file:///workspace/cpp/src/serving/embed_lookup.cpp) `LookupFn` | 已实现；需迁出独立 I/O 池 |
-| Frontend Encode | [engine/frontend](file:///workspace/cpp/src/engine/frontend.cpp) | 已实现；需迁出独立 CPU 池 |
-| KV I/O | [kv/store](file:///workspace/cpp/src/kv/store.cpp) LocalKVStore | 已实现 TTL/mget；需换 datasystem adapter + 独立 I/O 池 |
-| Stage I Compute | [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `encode_s` | **已实现**（C++ CPU，对拍通过） |
-| BatchScheduler | [serving/pipeline.cpp](file:///workspace/cpp/src/serving/pipeline.cpp) | **已实现**（C++ 攒批，满批/超时） |
-| Python Compute Bridge | 无 | **待实现**：嵌入 Python C API + PyTorch CUDA `score_ns_batch` |
-| Stage II 计算 | [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `score_ns_impl` | 当前 C++ CPU 实现（对拍通过）；**目标迁为 Python CUDA 下发** |
-| folly 阶段串联 | 无（各阶段在同一线程内串行） | **待引入** folly executor + `Future` 串联 |
+| Ingress | [net/http_server](file:///workspace/cpp/src/net/http_server.cpp) accept + worker 池 + `route_async` | **已实现**：接入线程提交后立即释放，响应由完成线程经 `done` 回调写回（幂等单次） |
+| EmbedLookup | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_lookup` @ `embed_lookup` 池 | **已实现**（IO 池独立分池 + 有界队列背压） |
+| Frontend Encode | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_encode` @ `frontend_encode` 池 | **已实现**（CPU 池独立分池；`lookup_ns`/`encode_ns_with` 两步式接口） |
+| KV I/O | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_kv` @ `kv_io` 池 | **已实现**（IO 池；后端当前为 LocalKVStore，datasystem adapter 待接入） |
+| Stage I Compute | [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `encode_s` @ `stage1_compute` 池 | **已实现**（C++ CPU，对拍通过） |
+| BatchScheduler | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `batch_loop`/`take_batch` | **已实现**（独立攒批线程；等首条→`max_wait` 窗口→满 `max_batch` 出批；miss 前置回填不进计算批） |
+| Python Compute Bridge | [serving/compute_bridge.cpp](file:///workspace/cpp/src/serving/compute_bridge.cpp) + [tools/bridge_score.py](file:///workspace/cpp/tools/bridge_score.py) | **已实现**：嵌入解释器 + 专用线程持 GIL 调 `score_batch`（PyTorch CUDA/CPU）；队列满/不可用自动降级 C++ |
+| Stage II 计算 | Python 桥（主）/ [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `score_ns_batch`（降级） | **已实现**（双后端：python/cpp 数值均对拍 golden < 1e-5） |
+| folly 阶段串联 | [common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) + SEDA 阶段链 | **已实现**（folly 语义等价物：功能分池 + 有界 FIFO + `ExecutorOverloaded` 快速失败；工程环境无 folly 依赖时零成本替换） |
 | datasystem adapter | [kv/store](file:///workspace/cpp/src/kv/store.cpp) LocalKVStore | 本地参考实现已有；**待接入 datasystem set/get** |
 
-**演进路径**：当前 `cpp/` 已有完整的 C++ CPU 端到端实现（Stage I + Stage II 全 C++，对拍 24/24 PASS）。下一阶段：① 引入 folly 分池与 Future 串联（编排 C++ 化）；② 接入 datasystem（KV 外置）；③ 新增 Python Compute Bridge（Stage II 计算换 CUDA）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
+**演进路径**：① ~~引入 folly 分池与 Future 串联（编排 C++ 化）~~ **已完成**（`Executor`/`ThreadPoolExecutor`/`ExecutorSet` + `ScoreFlow` SEDA 阶段链）；② 接入 datasystem（KV 外置）——**待做**（`LocalKVStore` 已满足接口契约 `put`/`get`/`mget`/`del`）；③ ~~新增 Python Compute Bridge（Stage II 计算换 CUDA）~~ **已完成**（`--compute-backend auto|python|cpp`，`auto` 优先 python、失败/队列满降级 cpp）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
 
 ### 7.5 关键数据结构
 

@@ -1,6 +1,6 @@
 # 实现 & 现状总结
 
-> 版本：v1.0（C++ 工程主线确立；Python 单机参照降为对拍基准）
+> 版本：v1.2（§7.4 混合架构落地：SEDA 编排 + Python 计算桥；Python 单机参照降为对拍基准）
 > 分支：`feat/onetrans-e2e-serving`
 > 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计见 [detailed_design.md](./detailed_design.md)。
 
@@ -8,41 +8,53 @@
 
 ## 0. C++ 工程主线（当前形态）
 
-**仓库现状**：`cpp/` 下已存在完整的端到端 C++ 实现（`a0c3eb5`，40 文件 / +5787 行），是当前的工程主线。Python 单机参照（`onetrans/`、`demo.py`）保留为**数值对拍基准与教学参照**，不再承接工程演进。
+**仓库现状**：`cpp/` 下已存在完整的端到端 C++ 实现，是当前的工程主线。**§7.4 混合架构已落地**：SEDA 分阶段编排（C++，folly 语义线程池）+ Stage II 计算桥（嵌入式 Python 解释器，PyTorch CUDA/CPU 下发算子）+ C++ CPU 数值等价降级路径。Python 单机参照（`onetrans/`、`demo.py`）保留为**数值对拍基准与教学参照**，不再承接工程演进。
 
-### 0.1 已交付（C++ 端到端，零第三方依赖）
+### 0.1 已交付（C++ 端到端 + 混合计算后端）
 
 | 交付物 | 位置 | 验证 |
 |---|---|---|
 | `onetrans_core` 静态库 | [cpp/src/](file:///workspace/cpp/src)（common/engine/kv/serving/net） | 数值对拍 24/24 PASS |
-| `onetrans_server` HTTP 服务 | [cpp/tools/server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) | e2e 7/7 PASS |
+| `onetrans_server` HTTP 服务（SEDA + 异步路由） | [cpp/tools/server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) | e2e 8/8 × 3 后端 PASS |
+| SEDA 流水线（lookup→encode→kv→batch→score） | [cpp/src/serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) | 并发 32 路 all-200 |
+| folly 语义线程池（IO/CPU 功能分池 + 背压） | [cpp/src/common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) | `ExecutorOverloaded` 快速失败 |
+| Python 计算桥（嵌入解释器 + 专用线程持 GIL） | [cpp/src/serving/compute_bridge.cpp](file:///workspace/cpp/src/serving/compute_bridge.cpp) | golden 对拍 1.49e-07 |
+| 桥侧 PyTorch 前向模块 | [cpp/tools/bridge_score.py](file:///workspace/cpp/tools/bridge_score.py) | 与 C++ `score_ns_batch` 等价 |
 | `verify_golden` 对拍工具 | [cpp/tools/verify_golden.cpp](file:///workspace/cpp/tools/verify_golden.cpp) | max diff < 1e-6 |
 | 权重/golden 导出 | [cpp/tools/export_weights.py](file:///workspace/cpp/tools/export_weights.py) + `gen_golden.py` | manifest + 二进制落盘 |
-| 端到端测试 | [cpp/tools/e2e_test.py](file:///workspace/cpp/tools/e2e_test.py) | ingest→score→对拍 golden |
+| 端到端测试（双后端 + 并发断言） | [cpp/tools/e2e_test.py](file:///workspace/cpp/tools/e2e_test.py) | `--backend cpp\|auto\|python` |
 
 ### 0.2 实测结果
 
 ```
 verify_golden：共 24 项，失败 0 项（C++ vs Python 全链路逐位等价，max diff < 1e-6）
-e2e_test（7/7 PASS）：
-  healthz / ingest(accepted, s_len=37) / score(max diff 2.38e-07 vs golden)
-  / kv_miss 降级全零 / metrics / route 404·405
+
+e2e_test（8/8 PASS × 3 后端）：
+  --backend cpp    ：healthz(backend=cpp) / ingest / score(max 2.38e-07) / kv_miss 全零
+                     / concurrent_32(all-200, hit 行对拍 golden) / metrics(flow.backend.cpp) / 404·405
+  --backend auto   ：healthz(backend=python, 桥就绪) / score(max 1.49e-07, 经 PyTorch 前向)
+                     / concurrent_32 / metrics(flow.backend.python) / 404·405
+  --backend python ：同 auto（强制桥路径；桥失败时服务启动即失败，不允许静默降级）
+
+并发：32 路混合 hit/miss score，全 200，0.12s 完成（Python 桥单线程持 GIL 不阻塞接入/编排）
+降级：桥队列满（cap=16）或 torch 不可用 → 自动走 C++ `score_ns_batch`（数值等价，e2e 守护）
 ```
 
-### 0.3 线程模型现状 → 目标
+### 0.3 线程模型现状（§7.4 已落地）
 
-当前 `cpp/` 已实现「**接入/计算分离 + 攒批**」：`net/http_server` accept 线程 + worker 池负责收发；`serving/pipeline` 的 `Dispatcher` + `BatchScheduler` 用独立 `score_threads` 消费批次做 `score_ns_batch`。**但 lookup/KV/encode 仍在 compute 线程内同步执行**（见 [detailed_design §7.4.9](./detailed_design.md)）。
+**SEDA 阶段链已实现**（[serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp)）：每阶段独立线程池 + 有界队列（满则 `ExecutorOverloaded` 快速失败→503），阶段间 `shared_ptr<Ctx>` move 传递所有权；接入层 `route_async` 提交后立即释放 worker，响应由完成线程写回。
 
-下一阶段目标：引入 **folly 功能分池 + `folly::Future` 阶段串联**，把 I/O（embedding lookup / KV I/O）与 CPU（encode / score）彻底解耦，达到 §7.4 的目标线程模型：
-
-| 阶段 | 目标池 | 当前落点 | 待办 |
+| 阶段 | 目标池 | 当前落点 | 状态 |
 |---|---|---|---|
-| Ingress | brpc bthread（仅收发+序列化） | `net/http_server`（已分离 accept，但 `/score` 同步 `fut.get()`） | 改异步回调 |
-| EmbedLookup | `IOThreadPoolExecutor` | `embed_lookup`（回调可注入，当前同步） | 迁出独立 I/O 池 |
-| Frontend Encode | `CPUThreadPoolExecutor` | `engine/frontend`（与 compute 同线程） | 迁出独立池 |
-| KV I/O | `IOThreadPoolExecutor` | `kv/store` LocalKVStore（当前同步） | 迁出独立 I/O 池 |
-| Compute | `CPUThreadPoolExecutor`（绑核） | `pipeline` Dispatcher+BatchScheduler | **已分池** |
-| 阶段串联 | folly `Future` + `via(executor)` | 无（同线程串行） | 引入串联 |
+| Ingress | brpc bthread（仅收发+序列化） | `net/http_server` accept+worker 池 + `route_async` 异步路由 | **已实现**（HTTP 版；brpc 待换） |
+| EmbedLookup | `IOThreadPoolExecutor` | `flow.stage_lookup` @ `embed_lookup` 池 | **已实现** |
+| Frontend Encode | `CPUThreadPoolExecutor` | `flow.stage_encode` @ `frontend_encode` 池 | **已实现** |
+| KV I/O | `IOThreadPoolExecutor` | `flow.stage_kv` @ `kv_io` 池 | **已实现**（后端 LocalKVStore，datasystem 待接） |
+| Stage I Compute | `CPUThreadPoolExecutor` | `nearline` @ `stage1_compute` 池 | **已实现** |
+| BatchScheduler | C++ 独立线程 | `flow.batch_loop`（等首条→窗口→满批出批） | **已实现** |
+| Python Compute Bridge | 专用线程（持 GIL） | `serving/compute_bridge`（队列满自动降级 cpp） | **已实现** |
+| Compute（降级） | `CPUThreadPoolExecutor` | `dispatch_cpp` @ `compute_cpp` 池 | **已实现** |
+| 阶段串联 | folly `Future` + `via(executor)` | `common/executor`（folly 语义等价物）+ 回调式串联 | **已实现**（回调式；brpc/folly 引入后可平滑替换） |
 
 ---
 
