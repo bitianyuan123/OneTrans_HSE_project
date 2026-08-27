@@ -1,6 +1,6 @@
 # 实现 & 现状总结
 
-> 版本：v1.2（§7.4 混合架构落地：SEDA 编排 + Python 计算桥；Python 单机参照降为对拍基准）
+> 版本：v1.3（真实 folly 引入 + datasystem C++ SDK 接入；正确性以 golden 二进制对拍为准，Python 不作为验证基准）
 > 分支：`feat/onetrans-e2e-serving`
 > 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计见 [detailed_design.md](./detailed_design.md)。
 
@@ -8,7 +8,7 @@
 
 ## 0. C++ 工程主线（当前形态）
 
-**仓库现状**：`cpp/` 下已存在完整的端到端 C++ 实现，是当前的工程主线。**§7.4 混合架构已落地**：SEDA 分阶段编排（C++，folly 语义线程池）+ Stage II 计算桥（嵌入式 Python 解释器，PyTorch CUDA/CPU 下发算子）+ C++ CPU 数值等价降级路径。Python 单机参照（`onetrans/`、`demo.py`）保留为**数值对拍基准与教学参照**，不再承接工程演进。
+**仓库现状**：`cpp/` 下已存在完整的端到端 C++ 实现，是当前的工程主线。**§7.4 混合架构已落地**：SEDA 分阶段编排（C++ **真实 folly** 线程池）+ Stage II 计算桥（嵌入式 Python 解释器，PyTorch CUDA/CPU 下发算子）+ C++ CPU 数值等价降级路径。Python 单机参照（`onetrans/`、`demo.py`）保留为**一次性 golden 生成源与教学参照**，不再作为在线正确性验证基准。
 
 ### 0.1 已交付（C++ 端到端 + 混合计算后端）
 
@@ -17,7 +17,7 @@
 | `onetrans_core` 静态库 | [cpp/src/](file:///workspace/cpp/src)（common/engine/kv/serving/net） | 数值对拍 24/24 PASS |
 | `onetrans_server` HTTP 服务（SEDA + 异步路由） | [cpp/tools/server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) | e2e 8/8 × 3 后端 PASS |
 | SEDA 流水线（lookup→encode→kv→batch→score） | [cpp/src/serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) | 并发 32 路 all-200 |
-| folly 语义线程池（IO/CPU 功能分池 + 背压） | [cpp/src/common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) | `ExecutorOverloaded` 快速失败 |
+| folly 真实线程池（CPU/IOThreadPoolExecutor 功能分池 + 背压） | [cpp/src/common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) | `ExecutorOverloaded` 快速失败 |
 | Python 计算桥（嵌入解释器 + 专用线程持 GIL） | [cpp/src/serving/compute_bridge.cpp](file:///workspace/cpp/src/serving/compute_bridge.cpp) | golden 对拍 1.49e-07 |
 | 桥侧 PyTorch 前向模块 | [cpp/tools/bridge_score.py](file:///workspace/cpp/tools/bridge_score.py) | 与 C++ `score_ns_batch` 等价 |
 | `verify_golden` 对拍工具 | [cpp/tools/verify_golden.cpp](file:///workspace/cpp/tools/verify_golden.cpp) | max diff < 1e-6 |
@@ -27,7 +27,7 @@
 ### 0.2 实测结果
 
 ```
-verify_golden：共 24 项，失败 0 项（C++ vs Python 全链路逐位等价，max diff < 1e-6）
+verify_golden：共 24 项，失败 0 项（C++ vs golden.bin 全链路逐位等价，max diff < 1e-6）
 
 e2e_test（8/8 PASS × 3 后端）：
   --backend cpp    ：healthz(backend=cpp) / ingest / score(max 2.38e-07) / kv_miss 全零
@@ -49,18 +49,18 @@ e2e_test（8/8 PASS × 3 后端）：
 | Ingress | brpc bthread（仅收发+序列化） | `net/http_server` accept+worker 池 + `route_async` 异步路由 | **已实现**（HTTP 版；brpc 待换） |
 | EmbedLookup | `IOThreadPoolExecutor` | `flow.stage_lookup` @ `embed_lookup` 池 | **已实现** |
 | Frontend Encode | `CPUThreadPoolExecutor` | `flow.stage_encode` @ `frontend_encode` 池 | **已实现** |
-| KV I/O | `IOThreadPoolExecutor` | `flow.stage_kv` @ `kv_io` 池 | **已实现**（后端 LocalKVStore，datasystem 待接） |
+| KV I/O | `IOThreadPoolExecutor` | `flow.stage_kv` @ `kv_io` 池 | **已实现**（后端 `DatasystemKVStore`/`LocalKVStore` 二选一，经 `KVStore` 接口注入） |
 | Stage I Compute | `CPUThreadPoolExecutor` | `nearline` @ `stage1_compute` 池 | **已实现** |
 | BatchScheduler | C++ 独立线程 | `flow.batch_loop`（等首条→窗口→满批出批） | **已实现** |
 | Python Compute Bridge | 专用线程（持 GIL） | `serving/compute_bridge`（队列满自动降级 cpp） | **已实现** |
 | Compute（降级） | `CPUThreadPoolExecutor` | `dispatch_cpp` @ `compute_cpp` 池 | **已实现** |
-| 阶段串联 | folly `Future` + `via(executor)` | `common/executor`（folly 语义等价物）+ 回调式串联 | **已实现**（回调式；brpc/folly 引入后可平滑替换） |
+| 阶段串联 | 回调式串联（`ScoreFlow` 阶段链） | `common/executor`（有界线程池）+ 回调式串联 | **已实现**（回调式） |
 
 ---
 
-## 1. 现状总览（Python 参照基准，降级为对拍底座）
+## 1. 现状总览（C++ 工程主线；正确性以 golden 二进制对拍为准）
 
-序列 Transformer 精排（OneTrans 类）的**单机参照实现**已固化，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级）。该实现的职责现为 C++ 主线的**数值对拍基准**（见 §0）；C++ 主线的接入/数据面/编排见 [detailed_design.md §7.4](./detailed_design.md)。
+序列 Transformer 精排（OneTrans 类）的**单机参照实现**已固化，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路；`demo.py` 仅用于**一次性生成 golden** 与教学演示，**不再作为在线正确性验证口径**。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级）。正确性基准为 `cpp/artifacts/golden/golden.bin` + `verify_golden`（见 §0）；C++ 主线的接入/数据面/编排见 [detailed_design.md §7.4](./detailed_design.md)。
 
 ---
 
@@ -160,10 +160,10 @@ append 乐观并发： 正确 offset 接受 / offset_conflict 拒绝 / cas_confl
 
 | 级别 | 缺口 | 证据 | 建议 |
 |---|---|---|---|
-| **P1** | 无 C++ Nearline/Online 热路径 worker：两阶段 brpc 分离部署目前仅 PS（`deploy/ps`）有 C++ 参考实现，混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/attention/mixed_attention.py`、`nn/ffn/mixed_ffn.py` | 以 Python 参照为数值基准，移植 Stage I/II 到 brpc+bthread worker + vLLM 自定义层 |
+| **P1** | 无 C++ Nearline/Online 热路径 worker：两阶段 brpc 分离部署目前仅 PS（`deploy/ps`）有 C++ 参考实现，混合参数化层未移植 vLLM 自定义 op | `deploy/ps/`（仅 PS）、`nn/attention/mixed_attention.py`、`nn/ffn/mixed_ffn.py` | 以 golden 二进制为数值基准，移植 Stage I/II 到 brpc+bthread worker + vLLM 自定义层 |
 | **P1** | tokenizer + 稀疏 embedding 查表未接入 serving 热路径：`ingest`/`score` 直接收已 tokenize 的 `s_emb`/`ns_emb`，行为流→查表→编码、特征服务→查表→打分未接线 | `pipeline.py`（`NearlineWorker.ingest` / `OnlineWorker.score` 签名收 `s_emb`/`ns_emb`） | 接通 `OneTransTokenizer` + `EmbeddingPSClient`（fabric ①）到 pipeline 入口 |
 | **P1** | ~~KV miss 硬失败（`raise KeyError`），无「陈旧读+打点」或「空 KV 快速返回」~~ | ✅ **M5 已修复**：`OnlineWorker.score`/`score_batch` miss 返回全零 logits + `kv.miss` 打点，单/批一致、不抛异常（`pipeline.py`） | 「陈旧读」降级路径待 M6 与 G4 一并考虑 |
-| **P1** | 无服务发现 / 模型版本注册中心：PS/datasystem 的 host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | `embedding_ps_client.py`（默认 127.0.0.1:8000）、`datasystem_adapter.py`（默认 127.0.0.1:31501） | 引入轻量服务发现 + 模型注册 + 配置/灰度开关 |
+| **P1** | 无服务发现 / 模型版本注册中心：PS/datasystem 的 host/port 硬编码，无版本→checkpoint/表版本映射与灰度开关 | `embedding_ps_client.py`（默认 127.0.0.1:8000）、C++ `DatasystemKVStore::Options`（默认 127.0.0.1:9088） | 引入轻量服务发现 + 模型注册 + 配置/灰度开关 |
 
 ---
 

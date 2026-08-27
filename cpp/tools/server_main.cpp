@@ -28,6 +28,9 @@
 #include "engine/two_stage.h"
 #include "kv/router.h"
 #include "kv/store.h"
+#ifdef ONETRANS_WITH_DATASYSTEM
+#include "kv/datasystem_store.h"
+#endif
 #include "net/http_server.h"
 #include "serving/compute_bridge.h"
 #include "serving/embed_lookup.h"
@@ -56,6 +59,9 @@ struct ServerConfig {
     std::string model_version = "v42";
     int shards = 1;
     int64_t kv_ttl_seconds = 0;
+    std::string kv_backend = "local";       // local | datasystem
+    std::string datasystem_host = "127.0.0.1";
+    int datasystem_port = 9088;
     std::string compute_backend = "auto";  // auto | python | cpp
     std::string bridge_module_dir = "cpp/tools";
     int bridge_init_timeout_s = 120;
@@ -84,6 +90,9 @@ ServerConfig parse_args(int argc, char** argv) {
         else if (a == "--model-version") c.model_version = next();
         else if (a == "--shards") c.shards = std::atoi(next().c_str());
         else if (a == "--kv-ttl-seconds") c.kv_ttl_seconds = std::atoll(next().c_str());
+        else if (a == "--kv-backend") c.kv_backend = next();
+        else if (a == "--datasystem-host") c.datasystem_host = next();
+        else if (a == "--datasystem-port") c.datasystem_port = std::atoi(next().c_str());
         else if (a == "--compute-backend") c.compute_backend = next();
         else if (a == "--bridge-module-dir") c.bridge_module_dir = next();
         else if (a == "--bridge-init-timeout") c.bridge_init_timeout_s = std::atoi(next().c_str());
@@ -110,7 +119,20 @@ int main(int argc, char** argv) {
         auto model = std::make_shared<OneTransModel>(OneTransModel::load(*store));
         auto frontend = std::make_shared<EmbeddingFrontend>(EmbeddingFrontend::load(*store));
         auto tables = std::make_shared<EmbeddingTables>(EmbeddingTables::load(*store));
-        auto kv_store = std::make_shared<LocalKVStore>(conf.kv_ttl_seconds);
+        // KV 后端选择（§1.4/§1.5）：datasystem（C++ SDK）或进程内 local 回退。
+        std::shared_ptr<KVStore> kv_store;
+#ifdef ONETRANS_WITH_DATASYSTEM
+        if (conf.kv_backend == "datasystem") {
+            DatasystemKVStore::Options ds_opt;
+            ds_opt.host = conf.datasystem_host;
+            ds_opt.port = conf.datasystem_port;
+            ds_opt.default_ttl_seconds = conf.kv_ttl_seconds;
+            kv_store = std::make_shared<DatasystemKVStore>(ds_opt);
+        }
+#endif
+        if (!kv_store) {
+            kv_store = std::make_shared<LocalKVStore>(conf.kv_ttl_seconds);
+        }
         auto metrics = std::make_shared<Metrics>();
         auto runner = std::make_shared<TwoStageRunner>(*model);
         Router router(conf.shards);
@@ -148,7 +170,7 @@ int main(int argc, char** argv) {
         // Nearline（§7.4.4：全 C++ CPU，Stage I Compute Pool 异步执行）
         ExecutorSet nearline_execs;
         auto nearline_pool =
-            nearline_execs.make("stage1_compute", conf.nearline_threads, conf.queue_cap);
+            nearline_execs.make("stage1_compute", conf.nearline_threads, conf.queue_cap, false);
         NearlineWorker nearline(*frontend, *runner, *kv_store, *metrics, tables->lookup_fn(),
                                 conf.model_version);
 

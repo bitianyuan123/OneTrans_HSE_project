@@ -41,14 +41,14 @@ public:
 
     // bridge 可为 nullptr（强制 C++ 路径）
     ScoreFlow(const EmbeddingFrontend& frontend, const TwoStageRunner& runner,
-              LocalKVStore& store, const LookupFn& lookup, Metrics& metrics,
+              KVStore& store, const LookupFn& lookup, Metrics& metrics,
               PythonComputeBridge* bridge, std::string model_version, Config cfg);
     ~ScoreFlow();
 
     void start();
     void stop();
 
-    // 回调式提交（生产路径，folly Future.then 语义）：完成线程直接调用 done
+    // 回调式提交（生产路径）：完成线程直接调用 done
     // （err 非空 = 流水线失败，outcome 无效）。done 保证恰好调用一次。
     using ScoreDone = std::function<void(ScoreOutcome out, const std::string& err)>;
     void submit(ScoreInput input, ScoreDone done);
@@ -90,7 +90,7 @@ private:
 
     const EmbeddingFrontend& frontend_;
     const TwoStageRunner& runner_;
-    LocalKVStore& store_;
+    KVStore& store_;
     LookupFn lookup_;
     Metrics& metrics_;
     PythonComputeBridge* bridge_;
@@ -98,10 +98,10 @@ private:
     Config cfg_;
 
     ExecutorSet executors_;
-    std::shared_ptr<ThreadPoolExecutor> lookup_pool_;
-    std::shared_ptr<ThreadPoolExecutor> encode_pool_;
-    std::shared_ptr<ThreadPoolExecutor> kv_pool_;
-    std::shared_ptr<ThreadPoolExecutor> compute_pool_;
+    std::shared_ptr<Executor> lookup_pool_;
+    std::shared_ptr<Executor> encode_pool_;
+    std::shared_ptr<Executor> kv_pool_;
+    std::shared_ptr<Executor> compute_pool_;
 
     // 攒批队列（独立于各池：批线程单消费者）
     std::mutex batch_mu_;

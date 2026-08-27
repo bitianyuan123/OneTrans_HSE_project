@@ -6,7 +6,7 @@
 namespace onetrans {
 
 ScoreFlow::ScoreFlow(const EmbeddingFrontend& frontend, const TwoStageRunner& runner,
-                     LocalKVStore& store, const LookupFn& lookup, Metrics& metrics,
+                     KVStore& store, const LookupFn& lookup, Metrics& metrics,
                      PythonComputeBridge* bridge, std::string model_version, Config cfg)
     : frontend_(frontend),
       runner_(runner),
@@ -20,10 +20,11 @@ ScoreFlow::ScoreFlow(const EmbeddingFrontend& frontend, const TwoStageRunner& ru
         unsigned int hw = std::thread::hardware_concurrency();
         cfg_.compute_threads = hw > 0 ? static_cast<int>(hw) : 4;
     }
-    lookup_pool_ = executors_.make("embed_lookup", cfg_.lookup_threads, cfg_.queue_cap);
-    encode_pool_ = executors_.make("frontend_encode", cfg_.encode_threads, cfg_.queue_cap);
-    kv_pool_ = executors_.make("kv_io", cfg_.kv_threads, cfg_.queue_cap);
-    compute_pool_ = executors_.make("compute_cpp", cfg_.compute_threads, cfg_.queue_cap);
+    // 功能分池（§7.4.2）：IO 池承接阻塞式网络/外部调用，CPU 池承接计算。
+    lookup_pool_ = executors_.make("embed_lookup", cfg_.lookup_threads, cfg_.queue_cap, true);
+    encode_pool_ = executors_.make("frontend_encode", cfg_.encode_threads, cfg_.queue_cap, false);
+    kv_pool_ = executors_.make("kv_io", cfg_.kv_threads, cfg_.queue_cap, true);
+    compute_pool_ = executors_.make("compute_cpp", cfg_.compute_threads, cfg_.queue_cap, false);
 }
 
 ScoreFlow::~ScoreFlow() { stop(); }

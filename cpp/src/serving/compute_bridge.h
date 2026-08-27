@@ -1,8 +1,8 @@
 // Python 计算桥（§7.4.5）：嵌入式解释器 + 专用线程持 GIL 下发 PyTorch 算子。
 //
 // 边界契约（与 docs/detailed_design.md §7.4 一致）：
-// - C++ 编排（lookup/encode/KV mget/攒批/回填）全部在 folly 语义线程池上运行，
-//   不触碰 GIL；
+// - C++ 编排（lookup/encode/KV mget/攒批/回填）全部在标准库线程池
+//   （common/executor.h）上运行，不触碰 GIL；
 // - 唯一持 GIL 的是本桥的专用线程：从有界队列取批 → PyGILState_Ensure →
 //   调 bridge_score.score_batch（PyTorch CUDA/CPU 前向）→ 回填回调 → Release；
 // - 队列满 / 解释器不可用 / torch 缺失 → available()==false 或 submit 返回

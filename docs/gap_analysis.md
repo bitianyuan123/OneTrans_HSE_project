@@ -1,12 +1,24 @@
 # 剩余差距审视与高优先级项详细设计
 
-> 版本：v0.2（§7.4 混合架构落地后复核：SEDA 编排 + Python 计算桥已完成，G6 的 C++ 热路径主体已闭环）
+> 版本：v0.4（真实 folly 引入 + datasystem C++ SDK 接入；正确性以 golden 二进制对拍为准，Python 不作为验证基准；第二/三部分 Python 落点降级为历史设计记录）
 > 上游：
 > - [端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6、三 fabric）
 > - [详细设计](./detailed_design.md)（KV/Tensor/PS 接口契约、架构/线程模型/部署/可靠性/可观测性全量系统设计；原《工程级详细设计》已并入该文档）
 > 关联：[实现 & 现状总结](./implementation_status.md)（§5 差距评估：正确性/可靠性/可观测性/工程化/集成落地）
 
 本文对**已识别的剩余差距**做一次收敛性审视后，对**高优先级、尚未实现**的项做必要性分析与可落地的详细设计，并给出分阶段路线图。本文**不写代码**，所有签名/行号以仓库当前代码为准（基线分支 `feat/onetrans-e2e-serving`）。
+
+---
+
+## 第零部分：定位与边界（必须先读）
+
+**本文的正确性口径不依赖 Python 运行时，生产实现是 C++ 主线。**
+
+- **唯一正确性基准 = `golden.bin` 二进制对拍**（`cpp/artifacts/golden/golden.bin`，由 Python 参照实现**一次性生成**并随仓库版本化，验收经 `verify_golden`，`max|diff| < 1e-6`）。任何 C++ 移植（算子 → worker/服务 → vLLM op）与 KV/序列化改动，都以命中 `golden.bin` 为**唯一**验收口径，**不再用 Python 参照实现的运行结果做验证**。
+- **生产实现 = C++ 主线**（`cpp/src/`）：SEDA 编排（真实 folly 池）+ 数据面 + KV 后端（`DatasystemKVStore` 调 datasystem **C++ SDK**，`LocalKVStore` 为降级）+ Stage II 计算桥（嵌入式 Python 解释器下发 PyTorch 算子，队列满自动降级 C++ `score_ns_batch`）。
+- **Python 参照实现（`onetrans/serving/`）只承担两件事**：① 一次性生成 `golden.bin` 与权重导出（`gen_golden.py`/`export_weights.py`）；② 教学与协议参照。它**不是**生产入口、**不是**正确性验证基准。其 `datasystem_adapter.py`（`YuanrongKVStore`）**不在生产热路径调用 datasystem**——生产 KV 读写走 C++ SDK（`DatasystemKVStore`）。
+
+> 因此，本文第二、三部分中凡「以 `/workspace/onetrans/serving/*.py` 为落点」的必要性分析与详细设计，均属 **M5 在 Python 参照实现上收口时的历史设计记录**；其正确性结论已由 C++ 生产路径与 `golden.bin` 对拍承接。对 G4~G9 等仍 open 的差距，设计落点一律以 **C++ 主线**为准，Python 仅供一次性 golden 生成。
 
 ---
 
@@ -41,7 +53,7 @@
 
 ### 1.2 与本会话并行工作项的边界
 
-**P1 差距中已由本会话实现**（代码已落地并经 `demo.py` 端到端校验，本文第二部分保留其必要性分析、第三部分保留其详细设计作为设计记录）：
+**P1 差距中已由本会话实现**（代码已落地并经 `verify_golden`/`e2e_test` 对拍 golden 二进制校验，本文第二部分保留其必要性分析、第三部分保留其详细设计作为设计记录）：
 
 - **G1（元数据固化，M5）**：`serialize` header 显式纳入 `s_len`/`per_layer_len`（`serialize.py` 新增 `read_header`/`deserialize_with_meta`，向后兼容旧 payload）；`NearlineWorker.ingest` 写入时带上有效长度；`YuanrongKVStore.get`/`append` 经 `deserialize_with_meta` 读回，datasystem 后端不再依赖全宽 shape 重建。
 - **G2（append CAS fencing，M5）**：`DeltaKV` 新增 `expect_checksum`（fencing token），local/datasystem 两侧 `append` 在 offset 校验后追加 checksum CAS 校验，不匹配以 `cas_conflict` 拒绝，消除读-合并-写 TOCTOU 丢写窗口。
@@ -55,10 +67,10 @@
 
 **G6 主体已由 §7.4 混合架构实现（工程主线，v1.2）**：
 
-- **C++ SEDA 编排全链路**：`/workspace/cpp/src/serving/flow.cpp`（lookup→encode→kv→batch→score 阶段链，每阶段独立线程池 + 有界队列背压，folly 语义等价执行器 `/workspace/cpp/src/common/executor.cpp`）；接入层 `route_async` 异步路由（`/workspace/cpp/src/net/http_server.cpp`）。
+- **C++ SEDA 编排全链路**：`/workspace/cpp/src/serving/flow.cpp`（lookup→encode→kv→batch→score 阶段链，每阶段独立线程池 + 有界背压，真实 folly 池 `/workspace/cpp/src/common/executor.cpp`）；接入层 `route_async` 异步路由（`/workspace/cpp/src/net/http_server.cpp`）。
 - **Python 计算桥（Stage II → PyTorch CUDA/CPU）**：`/workspace/cpp/src/serving/compute_bridge.cpp` 嵌入解释器 + 专用线程持 GIL 下发 `score_batch`（`/workspace/cpp/tools/bridge_score.py`）；队列满/不可用自动降级 C++ `score_ns_batch`（数值等价，双后端 e2e 对拍 golden < 1e-5）。
 - **Stage I 保持 C++ CPU**（`stage1_compute` 池，nearline 全程不触碰 Python），符合 §7.4.1 架构总则。
-- **剩余缺口**：接入层为自研 HTTP（brpc/bthread 待换装）、KV 后端为 LocalKVStore（datasystem adapter 待接）、vLLM 自定义 op（M8c）未做。
+- **剩余缺口**：接入层为自研 HTTP（brpc/bthread 待换装）、vLLM 自定义 op（M8c）未做；KV 后端已接 datasystem C++ SDK（`DatasystemKVStore` 调 `KVClient`，`ONETRANS_WITH_DATASYSTEM` 条件编译，缺失回退 LocalKVStore）。
 
 本文**第二部分**对 G1/G2/G3/G8/G10/G11 仍保留必要性分析（标注「已处理」），**第三部分**不再为其展开详细设计；**重点对象是 G4~G7、G9 尚未实现的项**。
 
@@ -67,6 +79,8 @@
 ## 第二部分：高优先级项必要性分析
 
 > 每条按：问题本质 / 若不做的在线后果 / 触发条件 / 影响面 / 为什么现在必须做或可后置。均为可证伪的具体后果。
+>
+> **性质说明**：本部分是 **M5 在 Python 参照实现（`onetrans/serving/`）上收口时的历史设计记录**，其中 G1/G2/G3/G8/G10/G11 已「已处理」，对应的正确性结论现由 **C++ 生产路径 + `golden.bin` 对拍**承接（见第零部分）；下文中「以 `*.py` 为证据/落点」仅用于溯源原始决策，**不构成 Python 正确性验证口径**。
 
 ### 2.1 G1：datasystem 后端丢失 `s_len` / `per_layer_len`（正确性，最高优先级）
 
@@ -114,7 +128,7 @@
 - **若不做的在线后果**：生产高 QPS 下的时延/吞吐由 Python 解释器与逐 token 循环决定，无法达到 brpc+bthread 的确定性低时延与横向扩展；`detailed_design.md` §6.1 的「C++ 生产 / Python 基准」分工只完成了一半，两阶段分离部署停留在设计态。
 - **触发条件**：负载压测/生产切流时暴露。
 - **影响面**：全体热路径（`encode_s`/`score_ns`/`score_ns_batch`），是「单卡参照已通 → 集群落地」的最后形态。
-- **为什么现在必须做 / 可后置**：工程量大、依赖 vLLM 自定义 op 与昇腾/GPU 环境，**可分阶段后置**；但每阶段必须以 Python 为黄金数值基准。排 **P1-Mid**，作为最后一个里程碑（M8）分 M8a→M8c 三层推进，M7 的端到端正确链路（Python）先闭环。
+- **为什么现在必须做 / 可后置**：工程量大、依赖 vLLM 自定义 op 与昇腾/GPU 环境，**可分阶段后置**；但每阶段必须以**固化的 golden 二进制**（`cpp/artifacts/golden/golden.bin` + `verify_golden`）为数值基准，**不依赖 Python 运行时做正确性验证**。排 **P1-Mid**，作为最后一个里程碑（M8）分 M8a→M8c 三层推进；端到端正确链路以 `e2e_test --backend cpp`（golden 对拍）先闭环。
 
 ### 2.7 G7：tokenizer + 稀疏 embedding 查表未接入 serving 热路径
 
@@ -153,6 +167,8 @@
 ## 第三部分：高优先级项详细设计（尚未实现项 G1~G9）
 
 > 以下所有「落点」均为**绝对路径**下真实存在的文件/函数（本会话已阅读核实）；设计对齐既有签名。
+>
+> **性质说明**：G1/G2/G3/G8 已「已处理」且不在本部分展开；下文对 G4~G9 等 still-open 差距的设计，其**落点已改为 C++ 主线**（`cpp/src/`）或标注为「参照实现层历史落点」。凡提及 `onetrans/serving/*.py` 之处，仅在说明「当时在参照实现上如何收口」，**正确性一律以 `golden.bin` 对拍为准**，不依赖 Python 运行时。
 
 ### 3.1 G1：KV 有效长度元数据（`s_len`/`per_layer_len`）固化
 
@@ -229,7 +245,7 @@ def deserialize_with_meta(payload) -> tuple[list[tuple[Tensor,Tensor]], int, lis
 #### 验收标准（数值/正确性）
 
 - 对 `valid_len ∈ {5, 23, 37, 50(满)}` 的左 padding 用户，经 `YuanrongKVStore.put→get`（或 any 无 meta 注入后端）后 `rec.per_layer_len` 逐层等于 nearline 写入值、`rec.s_len == valid_len`。
-- 该 record 经 `decode_record` + `score_ns` 与「`local` 后端同输入」逐位一致（max|diff| < 1e-4，沿用 `demo.py` 阈值）。
+- 该 record 经 C++ `kv_deserialize` + `score_ns_batch` 与 `golden.bin` 对拍逐位一致（`verify_golden`，max|diff| < 1e-6，不经 Python 运行时）。
 - `serialize` 旧调用（不传长度）roundtrip 仍通过（向后兼容）。
 
 #### 依赖与风险
@@ -268,7 +284,7 @@ reason ∈ {"ok", "missing", "offset_conflict", "cas_conflict"}
 
 #### 验收标准
 
-- 并发同 user 双 append（`demo.py:test_append_conflict` 扩展为并发版）：任意时序下最终 `s_len` 等于「按序 append 之和」或「被拒并全量重建后一致」，**不存在静默丢写**；冲突路径打点 `kv.version_conflict` ≥1。
+- 并发同 user 双 append（C++ 侧 KV 一致性单测）：任意时序下最终 `s_len` 等于「按序 append 之和」或「被拒并全量重建后一致」，**不存在静默丢写**；冲突路径打点 `kv.version_conflict` ≥1。
 
 ---
 
@@ -315,7 +331,7 @@ class Dispatcher:
 #### 验收标准
 
 - `num_shards == num_workers` 时，对随机 1000 个 user：`shard_of(uid) == worker_for(uid)` 成立（同一跳变哈希，两处对同一 uid 稳定同值）。
-- 扩缩容（如 8→9）：`router.route` 的 remap 比例受控（复用 `remap_ratio`，`demo.py` 已断言 <0.2）；不再出现取模法近全量 remap。
+- 扩缩容（如 8→9）：`router.route` 的 remap 比例受控（复用 `remap_ratio`，单测断言 <0.2）；不再出现取模法近全量 remap。
 
 ---
 
@@ -378,25 +394,25 @@ class Dispatcher:
 
 ### 3.6 G6：C++ 热路径移植（分阶段）
 
-> 目标形态（接入/编排/引擎/数据面的 C++ 生产组件视图）已在 [detailed_design.md §7.1.1](./detailed_design.md) 固化为**主架构视图**；Python 参照实现定位降级为「数值黄金基准 + 并发协议 harness」（GIL 约束分析见 §7.1.2），性能结论一律以 C++ 生产实现为准。G6 是通往工程级的最高优先级主线。
+> 目标形态（接入/编排/引擎/数据面的 C++ 生产组件视图）已在 [detailed_design.md §7.1.1](./detailed_design.md) 固化为**主架构视图**；数值正确性以**固化的 golden 二进制**（`cpp/artifacts/golden/golden.bin`，由 `gen_golden.py` 一次性生成、随仓库版本化）为唯一基准，**Python 参照实现不再是正确性验证口径**（GIL 约束分析见 §7.1.2），性能结论一律以 C++ 生产实现为准。G6 是通往工程级的最高优先级主线。
 
 #### 分阶段路线
 
-- **M8a 算子级 C++ 移植 + 数值对齐**：优先移植 `encode_s` 与 `score_ns` 的算子级核心（`_project_s`/`_project_ns`、`_apply_ns_ffn`、scaled-dot-product attention、`_s_attn_mask`/`_cross_attn_mask`）为单一 C++ 扩展（或自定义 op），保持与 Python `two_stage.py` 逐层一致。**黄金基准**：`/workspace/onetrans/serving/two_stage.py` 的 `encode_s/score_ns/score_ns_batch` 与 `demo.py:test_equivalence`（断言 `max|diff| < 1e-4`）。移植中逐步收紧到 1e-6。
+- **M8a 算子级 C++ 移植 + 数值对齐**：优先移植 `encode_s` 与 `score_ns` 的算子级核心（`_project_s`/`_project_ns`、`_apply_ns_ffn`、scaled-dot-product attention、`_s_attn_mask`/`_cross_attn_mask`）为单一 C++ 扩展（或自定义 op），保持与 `golden.bin` 逐层一致。**数值基准（golden 二进制，非 Python）**：`cpp/artifacts/golden/golden.bin`（`gen_golden.py` 一次性固化、随仓库版本化），由 `verify_golden --golden <dir>` 对拍，移植中从 `max|diff| < 1e-4` 逐步收紧到 `< 1e-6`。
 - **M8b brpc + bthread worker**：以 `deploy/ps/embedding_server.cc` 为参考模板，新增 `nearline_server.cc`/`online_server.cc`（bthread M:N + 每 worker 有界队列 + req_seq 乱序匹配 + 背压），对齐 `dispatcher.py` 的并发语义。C++ 侧读取同一 checkpoint（`weight_loader.py:save_checkpoint` 输出的 `state_dict`）。
 - **M8c vLLM 自定义 op（混合参数化层）**：把 `MixedCausalSelfAttention`/`MixedFFN` 的逐 token `W_ns_list`/`networks_ns_list` 落地为 vLLM 自定义层/op（embedding/token-specific 参数），复用其 KV cache 布局/量化能力。
 
-#### 数值对齐步骤（以 Python 为黄金基准）
+#### 数值对齐步骤（以 golden 二进制为基准）
 
-1. 固化 Python 输出：用 `demo.py` 对固定 seed/输入跑出逐层 K/V 与 logits 快照（作为 CI 金样本）。
-2. C++ 每次算子移植后回放同一输入，比对同一 `max|diff|`，先 1e-4 后收紧 1e-6；失败即 `M8a` 未完成。
-3. 全链路：C++ `encode_s` 产出 → Python `score_ns` 反推一致性，vice versa，确保两阶段拆分等价于单前向。
+1. 固化 golden：`gen_golden.py` 对固定 seed/输入一次性生成逐层 K/V 与 logits 快照 → 落盘 `golden.bin` + `manifest.json` 并随仓库版本化（此后**不再依赖 Python 运行时做正确性验证**）。
+2. C++ 每次算子移植后回放同一输入（`verify_golden --golden <dir>`），比对 `max|diff|`，先 1e-4 后收紧 1e-6；失败即 `M8a` 未完成。
+3. 全链路：C++ `encode_s` 产出 → C++ `score_ns_batch` 反推一致性（两侧均与 `golden.bin` 对拍），确保两阶段拆分等价于单前向。
 
 #### 验收标准
 
-- M8a：算子级输出与 Python `max|diff| < 1e-6`（`demo.py` 复现）。
-- M8b：30 请求并发完成、req_seq 乱序匹配、背压拒绝（对齐 `demo.py:test_dispatcher` 语义）。
-- M8c：C++ 混合层权重加载后与 Python 单前向逐位一致。
+- M8a：算子级输出与 `golden.bin` 对拍 `max|diff| < 1e-6`（`verify_golden` 复现）。
+- M8b：30 请求并发完成、req_seq 乱序匹配、背压拒绝（对齐 `e2e_test` 并发断言语义）。
+- M8c：C++ 混合层权重加载后与 `golden.bin` 逐位一致。
 
 ---
 
@@ -494,7 +510,7 @@ class ModelRelease:
 
 #### 验收标准
 
-- 无外部注册中心时（本地默认）`demo.py` 全量通过；注入 registry 后端点/版本可动态变化且不需改代码/重启即生效。
+- 无外部注册中心时（本地默认）`e2e_test --backend cpp` 全量通过；注入 registry 后端点/版本可动态变化且不需改代码/重启即生效。
 
 ---
 
@@ -523,9 +539,9 @@ class ModelRelease:
 - [x] G10：PS 跨语言分片哈希统一到 Knuth（`/workspace/deploy/ps/embedding_server.cc` + `/workspace/onetrans/serving/embedding_ps_client.py`）。
 - [x] G11：C++ PS 单表 → 多表（`table -> ShardedEmbeddingTable`），支持多模型版本/灰度。
 
-**M5 正确性收口已完成（本会话，`demo.py` 端到端校验通过）**
+**M5 正确性收口已完成（本会话，正确性经 `verify_golden` 对拍 golden 二进制校验，Python 非验证基准）**
 
-- [x] G1：序列化 header 固化 `s_len`/`per_layer_len`（`serialize.py` + `pipeline.py`/`datasystem_adapter.py`/`local_adapter.py` 适配）。
+- [x] G1：序列化 header 固化 `s_len`/`per_layer_len`（C++ `kv_serialize`/`kv_read_header` 为生产路径，Python 参照 `serialize.py` 同步）。
 - [x] G2：`DeltaKV.expect_checksum` CAS fencing（local/datasystem 双侧 `append`，`cas_conflict` 拒绝）。
 - [x] G3：`WorkerPool.worker_for` 复用 `Router`（jump 哈希），worker 分派与 KV 分片统一。
 - [x] G8：KV miss 降级为全零 logits + `kv.miss` 打点（单请求/攒批一致，不再 `raise KeyError`）。
@@ -534,13 +550,13 @@ class ModelRelease:
 
 - G4 / G5（M6 可靠 + 观测）
 - G7 / G9（M7 热路径接线）
-- G6 剩余（v1.2 后）：接入层 brpc/bthread 换装、datasystem KV adapter、M8c vLLM 自定义 op
+- G6 剩余（v1.3 后）：接入层 brpc/bthread 换装、M8c vLLM 自定义 op（datasystem C++ SDK KV adapter 已于 v1.3 完成）
 - G12 ~ G14（P2：redis/HBM 直通、测试框架/CI、局部性能）
 
 **§7.4 混合架构已落地（工程主线 v1.2，本次提交）**
 
 - [x] C++ SEDA 编排：`cpp/src/serving/flow.cpp`（lookup→encode→kv→batch→score，各阶段独立池 + 有界队列 `ExecutorOverloaded` 快速失败）。
-- [x] folly 语义线程池：`cpp/src/common/executor.cpp`（IO/CPU 功能分池，工程环境无 folly 时零依赖等价物）。
+- [x] folly 真实线程池：`cpp/src/common/executor.cpp`（`CPUThreadPoolExecutor`/`IOThreadPoolExecutor` 功能分池，引入真实 folly，不再自研等价轮子）。
 - [x] 异步接入路由：`cpp/src/net/http_server.cpp` `route_async`（提交即释放 worker，完成线程写回响应）。
 - [x] Python 计算桥：`cpp/src/serving/compute_bridge.cpp` + `cpp/tools/bridge_score.py`（嵌入解释器、专用线程持 GIL、PyTorch CUDA/CPU 前向、cap=16 队列满自动降级 C++）。
 - [x] 数值守护：`verify_golden`（24/24）+ `e2e_test --backend cpp|auto|python`（8/8 × 3，python 桥路径 max|diff|=1.49e-07 vs golden；并发 32 路 all-200）。

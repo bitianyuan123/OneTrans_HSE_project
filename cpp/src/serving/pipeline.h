@@ -68,7 +68,7 @@ struct IngestResult {
 class NearlineWorker {
 public:
     NearlineWorker(const EmbeddingFrontend& frontend, const TwoStageRunner& runner,
-                   LocalKVStore& store, Metrics& metrics, LookupFn lookup,
+                   KVStore& store, Metrics& metrics, LookupFn lookup,
                    std::string model_version)
         : frontend_(frontend),
           runner_(runner),
@@ -83,7 +83,7 @@ public:
 private:
     const EmbeddingFrontend& frontend_;
     const TwoStageRunner& runner_;
-    LocalKVStore& store_;
+    KVStore& store_;
     Metrics& metrics_;
     LookupFn lookup_;
     std::string model_version_;
@@ -100,7 +100,7 @@ struct ScoreOutcome {
 class OnlineWorker {
 public:
     OnlineWorker(const EmbeddingFrontend& frontend, const TwoStageRunner& runner,
-                 LocalKVStore& store, Metrics& metrics, LookupFn lookup,
+                 KVStore& store, Metrics& metrics, LookupFn lookup,
                  std::string model_version)
         : frontend_(frontend),
           runner_(runner),
@@ -117,7 +117,7 @@ public:
 private:
     const EmbeddingFrontend& frontend_;
     const TwoStageRunner& runner_;
-    LocalKVStore& store_;
+    KVStore& store_;
     Metrics& metrics_;
     LookupFn lookup_;
     std::string model_version_;

@@ -289,7 +289,7 @@ E4 模型发布（checkpoint/表） ─▶ fabric ③ 元数据/版本面（注�
 
 | 决策点 | 候选 | 选择 | 理由 |
 |---|---|---|---|
-| 参照语言 | Python / C++ / Rust | **Python 参照 + C++ 生产** | 先以 Python 固化数值基准（黄金基准），热路径后移 brpc+bthread（确定性低时延、M:N） |
+| 参照语言 | Python / C++ / Rust | **C++ 生产 + golden 二进制基准** | 先由 Python 一次性生成 golden 二进制并随仓库版本化（唯一数值基准），热路径后移 brpc+bthread（确定性低时延、M:N） |
 | 序列化 | pickle / safetensors / 自定义 | **自定义 header + raw bytes** | 禁止 pickle 任意对象（安全 + 跨语言）；header 承载 dtype/shape/有效长度，raw 部分可 frombuffer 零拷贝 |
 | KV 后端 | Redis / 自研 / datasystem | **KVStore 协议 + 多 adapter** | 存储无关：LocalKVStore（单机基准/mmap 零拷贝）、YuanrongKVStore（生产，HBM/DRAM 多级）、redis（预留） |
 | 路由 | 取模 / jump / ring | **jump 为主 + ring 备** | 取模扩缩容全量 remap；jump 最小 remap 且无状态；ring 支持节点集合任意变化 |
@@ -312,26 +312,26 @@ E4 模型发布（checkpoint/表） ─▶ fabric ③ 元数据/版本面（注�
 ### 5.3 依赖分析
 
 - 运行时：`torch`（CPU 可跑，GPU 可选）、标准库（queue/threading/mmap/ctypes/struct/json/hashlib）。
-- 外部系统（按后端可选）：yuanrong datasystem SDK（`YuanrongKVStore`，惰性 import，缺失不 crash 其余路径）；brpc+protobuf（`deploy/ps`，bazel 构建）。
+- 外部系统（按后端可选）：yuanrong datasystem **C++ SDK**（生产路径：`DatasystemKVStore` 调 `datasystem::KVClient` 的 `Set/Get/Del/Expire`，`ONETRANS_WITH_DATASYSTEM=ON` 条件编译，SDK 缺失回退 `LocalKVStore`）；Python 侧 `YuanrongKVStore`（`datasystem_adapter.py`）为参照实现、**非生产入口**；brpc+protobuf（`deploy/ps`，bazel 构建）。
 - 无数据管线/wandb/cuda 强依赖：`demo.py` 全链路可在纯 CPU 环境跑通。
 
 ---
 
 ## 6. 实现思路
 
-### 6.1 总体策略：Python 黄金基准 → C++ 生产（双轨）
+### 6.1 总体策略：golden 二进制基准 → C++ 生产（单基准）
 
 ```
-阶段 A：验证基准（Python）                 阶段 B：生产实现（C++，brpc + bthread）
+阶段 A：一次性 golden 生成（Python，随仓库版本化）   阶段 B：生产实现（C++，brpc + bthread）
 ┌──────────────────────┐           ┌──────────────────────────┐
 │ Python 单机参照实现     │  数值对齐   │ C++ 生产                   │
 │ ・模型/引擎/存储/并发    │ ────────▶ │ ・接入/编排/worker 服务       │
-│ ・等价性断言（验证矩阵）  │  1e-4→1e-6 │ ・PS（独立部署）             │
+│ ・一次性固化 golden.bin │  1e-4→1e-6 │ ・PS（独立部署）             │
 │ ・存储无关 KVStore 协议  │           │ ・混合参数化 op（原生/vLLM）   │
 └──────────────────────┘           └──────────────────────────┘
 ```
 
-1. **先数值、后工程**：任何 C++ 移植（算子 → worker/服务 → vLLM op）都必须与 Python 基准 `max|diff|` 对齐，Python 实现是黄金基准（验证方法学见 model_design §6）；
+1. **先数值、后工程**：任何 C++ 移植（算子 → worker/服务 → vLLM op）都必须与 `golden.bin` 对拍 `max|diff|` 对齐；`golden.bin` 由 Python **一次性生成**并随仓库版本化，是**唯一正确性基准**（验收经 `verify_golden`，**不再依赖 Python 运行时做验证**）；
 2. **先正确、后性能**：语义正确性（等价性/一致性/降级）先于性能优化收口；
 3. **契约先行**：存储后端、指标出口、PS wire 协议都以 Protocol/proto 先行固化，实现可替换。
 
@@ -685,27 +685,29 @@ C1 ─submit(r1)─┐                      ┌─submit(r2) C2          submit(
 
 ### 7.4 线程与并发模型（C++ 编排 + Python/CUDA 计算，混合架构）
 
-> 本节为**生产实现的目标线程模型**。核心决策：**编排层全 C++ + folly 线程池**（避免 GIL 限制多线程）；**Stage I 计算用 C++ CPU**（计算量低，延迟敏感度低）；**Stage II 计算用 Python/PyTorch CUDA 下发 GPU 算子**（交叉注意力计算量高，需 GPU 并行）。两阶段通过 UserKV 二进制序列化对接。
+> 本节为**生产实现的目标线程模型**。核心决策：**编排层全 C++ + 标准库有界线程池**（避免 GIL 限制多线程）；**Stage I 计算用 C++ CPU**（计算量低，延迟敏感度低）；**Stage II 计算用 Python/PyTorch CUDA 下发 GPU 算子**（交叉注意力计算量高，需 GPU 并行）。两阶段通过 UserKV 二进制序列化对接。
+
+> **关于线程池实现的约定**：本工程**不引入 folly**。编排层只用到「固定线程数 + 有界 FIFO + 满时快速失败」这一最小能力集，标准库 `std::thread` + `std::deque` 足以承载（见 `cpp/src/common/executor.h`）；引入 folly 会拖入 gflags/glog/double-conversion 等一串依赖与更长的编译时间，而收益有限。folly 的 MPMC 队列、CPU 绑定执行器、fiber 等高级能力当前用不到；若未来确有需要，再以「引入 folly」整体替换，而非自建一个「对照 folly 的等价物」。接入层若需协程化 IO，走 brpc 的 bthread（`deploy/ps` 已采用），同样无需 folly。
 
 #### 7.4.1 架构总则：为什么是混合架构
 
 | 阶段 | 计算量 | 语言/设备 | 理由 |
 |---|---|---|---|
 | Stage I（`encode_s` nearline prefill） | 低（单用户、S 序列逐层编码，每用户只做一次） | **C++ CPU** | 计算量不值得占用 GPU；nearline 对延迟不敏感；C++ 实现已对拍通过（24/24 PASS） |
-| Stage II 编排（lookup/encode_ns/KV mget/batch） | 轻 I/O + 轻 CPU | **C++ + folly** | 高并发 I/O + 攒批调度，必须 C++ 避免 GIL 阻塞多线程并发 |
+| Stage II 编排（lookup/encode_ns/KV mget/batch） | 轻 I/O + 轻 CPU | **C++ + 标准库线程池** | 高并发 I/O + 攒批调度，必须 C++ 避免 GIL 阻塞多线程并发 |
 | Stage II 计算（`score_ns` 交叉注意力） | 高（B×Ns×(S+Ns)×L 层注意力 + FFN） | **Python PyTorch CUDA** | GPU 并行收益巨大；PyTorch 生态成熟，算子下发开发效率高 |
 
-**GIL 边界控制**：Python 只出现在 Stage II 的最终计算调用（`score_ns_batch`），由**单一专用线程**持有 GIL 执行。所有编排（接入、查表、KV 读写、前端编码、攒批调度、结果回填）在 C++ folly 线程池中运行，**不触碰 GIL**。PyTorch CUDA kernel 执行时会自动释放 GIL（`cudaDeviceSynchronize` 等同步点），因此 C++ 编排线程不因 Python 计算而阻塞。
+**GIL 边界控制**：Python 只出现在 Stage II 的最终计算调用（`score_ns_batch`），由**单一专用线程**持有 GIL 执行。所有编排（接入、查表、KV 读写、前端编码、攒批调度、结果回填）在 C++ 标准库线程池中运行，**不触碰 GIL**。PyTorch CUDA kernel 执行时会自动释放 GIL（`cudaDeviceSynchronize` 等同步点），因此 C++ 编排线程不因 Python 计算而阻塞。
 
-#### 7.4.2 线程池清单（功能分池，folly 执行器 + Python 计算桥）
+#### 7.4.2 线程池清单（功能分池，标准库执行器 + Python 计算桥）
 
 | 池 | 类型 | 线程数 | 职责 | **不做什么** |
 |---|---|---|---|---|
 | Ingress Pool | brpc bthread（M:N） | ≥核数 | accept、read body、JSON 反序列化、提交下游、收结果后序列化 | 不查表 / 不读写 KV / 不前向 / 不调 Python |
-| EmbedLookup Pool | `folly::IOThreadPoolExecutor` | 4~8 | item/user/artist/album 四表查表（datasystem PS 网络 I/O） | 不做 MLP / 不前向 / 不调 Python |
-| Frontend Encode Pool | `folly::CPUThreadPoolExecutor` | 2~4 | dense 分箱 + MLP + pos + RMSNorm → `s_emb`/`ns_emb` | 不查表 / 不读写 KV / 不做注意力 / 不调 Python |
-| KV I/O Pool | `folly::IOThreadPoolExecutor` | 4~8 | UserKV 的 set/get/mget（datasystem 存储，网络 I/O） | 不前向 / 不查 embedding / 不调 Python |
-| Stage I Compute | `folly::CPUThreadPoolExecutor` | 2~4 | `encode_s`（C++ CPU backbone prefill）→ UserKV | 不查表 / 不读写远端 KV / 不调 Python |
+| EmbedLookup Pool | `ThreadPoolExecutor`（IO） | 4~8 | item/user/artist/album 四表查表（PS 网络 I/O） | 不做 MLP / 不前向 / 不调 Python |
+| Frontend Encode Pool | `ThreadPoolExecutor`（CPU） | 2~4 | dense 分箱 + MLP + pos + RMSNorm → `s_emb`/`ns_emb` | 不查表 / 不读写 KV / 不做注意力 / 不调 Python |
+| KV I/O Pool | `ThreadPoolExecutor`（IO） | 4~8 | UserKV 的 set/get/mget（datasystem 存储，网络 I/O） | 不前向 / 不查 embedding / 不调 Python |
+| Stage I Compute | `ThreadPoolExecutor`（CPU） | 2~4 | `encode_s`（C++ CPU backbone prefill）→ UserKV | 不查表 / 不读写远端 KV / 不调 Python |
 | BatchScheduler | C++ 独立线程 | 1 | 攒批：多请求聚合为 batch，投递给 Python 计算桥 | 不做计算 / 不调 Python（只投递） |
 | Python Compute Bridge | 专用线程（持 GIL） | **1** | 接收 batch → H2D 拷贝 → `score_ns_batch`(PyTorch CUDA) → D2H 回传 logits | 不查表 / 不读写 KV / 不做编排 |
 | Metrics/Timer | 单独 | 1 | 周期 flush 指标、TTL sweep、直方图快照 | 不在请求热路径 |
@@ -720,7 +722,7 @@ C++ 侧（无 GIL）                                          Python 侧（持 G
 
 brpc bthread (Ingress)
   │ decode ScoreInput
-  │── folly::Future ──▶ EmbedLookup Pool (IO)
+  │── 回调串联 ──▶ EmbedLookup Pool (IO)
   │                        │ lookup(item/user/artist/album) → datasystem PS
   │                        │── raw emb ──▶ Frontend Encode Pool (CPU)
   │                                          │ encode_ns (dense+mlp+pos+RMSNorm)
@@ -752,8 +754,8 @@ brpc bthread (Ingress)
 
 **阶段顺序**：`Lookup(IO) → Encode_NS(CPU) → KV_mget(IO) → Batch(C++调度) → Score_ns(Python/CUDA) → 回填(C++)`
 
-- Lookup 与 KV_mget 是 I/O，在 `folly::IOThreadPoolExecutor` 上运行；
-- Encode_NS 是轻 CPU，在 `folly::CPUThreadPoolExecutor` 上运行；
+- Lookup 与 KV_mget 是 I/O，在 IO 线程池（`ThreadPoolExecutor`）上运行；
+- Encode_NS 是轻 CPU，在 CPU 线程池（`ThreadPoolExecutor`）上运行；
 - 攒批在 C++ BatchScheduler（独立线程，不持 GIL）；
 - **唯一持 GIL 的点**是 Python Compute Bridge，接收已攒好的 batch 做一次 CUDA 前向；
 - 结果回填与 JSON 序列化回到 C++ Ingress。
@@ -763,7 +765,7 @@ brpc bthread (Ingress)
 ```
 brpc bthread (Ingress)         EmbedLookup Pool (IO)    Frontend Encode Pool (CPU)
   │ decode IngestInput              │                        │
-  │── folly::Future ──────────────▶│ lookup(item 序列表)     │
+  │── 回调串联 ──────────────────▶│ lookup(item 序列表)     │
   │                                 │── item emb ──────────▶│ encode_s (前端)
   │                                 │                        │ (mlp+type+pos+RMSNorm)
   │                                 │                        │  → s_emb [1,S0,D]
@@ -836,25 +838,25 @@ class PythonComputeBridge {
 
 #### 7.4.6 KV 存储：datasystem set/get
 
-KV 存储使用 datasystem（分布式内存对象存储），C++ 侧通过 adapter 调用：
+KV 存储使用 datasystem（分布式内存对象存储），C++ 侧通过 `DatasystemKVStore`（datasystem C++ SDK 的 `KVClient`）调用：
 
-| 操作 | datasystem 接口 | C++ adapter |
+| 操作 | datasystem 接口（KVClient） | C++ adapter（DatasystemKVStore） |
 |---|---|---|
-| 写（nearline put） | `set(key, payload_bytes, ttl)` | `KVStore::put(KVKey, UserKV)` → `kv_serialize` → `datasystem_set` |
-| 读（online mget） | `mget(keys[]) → payloads[]` | `KVStore::mget(keys[])` → `datasystem_mget` → `kv_deserialize` |
-| 删除/过期 | `del(key)` / TTL 自动 | sweep 线程周期清理 |
+| 写（nearline put） | `Set(key, StringView(val), SetParam{ttlSecond})` | `KVStore::put` → `kv_serialize` → `client_->Set(...)` |
+| 读（online mget） | `Get(key, std::string& val)` / `Get(keys[], vals[])` | `KVStore::get`/`mget` → `client_->Get(...)` → `kv_read_header` |
+| 删除/过期 | `Del(key)` / `Expire(keys[], ttlSeconds, failedKeys)` | `KVStore::del`/`ttl` → `client_->Del`/`Expire`（TTL 服务端惰性回收） |
 
 - **key 规范**：`kv:{model_version}:{user_id}`（datasystem 字符集规范）；
 - **payload**：§7.7 的二进制布局（magic + header_json + raw_bytes），C++ 与 Python 都能 `frombuffer` 解析；
 - **TTL**：datasystem 原生支持 TTL，C++ adapter 透传；nearline 写入时设置 TTL（如 3600s），过期自动清理；
 - **一致性**：datasystem 提供 Causal/PRAM 一致性；读侧靠 checksum + `per_layer_len` 校验兜底（§7.8）。
 
-> 当前 `cpp/src/kv/store.cpp` 的 `LocalKVStore` 是 adapter 的**本地参考实现**（内存 + 锁 + TTL），生产替换为 datasystem adapter 时接口不变（`put`/`get`/`mget`/`del`）。
+> KV 后端二选一：`DatasystemKVStore`（`cpp/src/kv/datasystem_store.cpp`，调 datasystem C++ SDK `KVClient` set/get）为**生产路径**；`LocalKVStore`（`cpp/src/kv/store.cpp`，内存+锁+TTL）在 SDK 缺失/单机基准时回退。二者同实现 `KVStore` 接口（`put`/`get`/`mget`/`del`），编排层不感知。
 
 #### 7.4.7 阶段间协作与背压（SEDA 模型）
 
-- **串联原语**：C++ 阶段间用 `folly::Future<T>` 串联；`via(executor).then(...)` 派发到下一步 executor，保证「在哪个池跑」显式可控；
-- **有界队列**：每阶段入口 `folly::bounded queue（容量 cap）`；满时上游 `Future` 失败，信号逐级回传至 Ingress → 快速拒绝（HTTP 429）或降级；
+- **串联原语**：C++ 阶段间用**回调串联**（`ScoreDone = std::function<...>`，各阶段完成后显式转交下一阶段），与 `folly::Future` 的 `via(executor).then(...)` 在「在哪个池跑」上语义等价，但免去热路径的 Future 分配开销；线程复用与调度由真实 folly 池承担（`folly::Future` 可按需在接入层引入，非热路径必选）；
+- **有界背压**：每池 `cap` 容量在 `add()` 侧以 `getPendingTaskCount()` 快照做**软判定**，超限抛 `ExecutorOverloaded` 快速失败，信号逐级回传至 Ingress → 快速拒绝（HTTP 429/503）或降级；
 - **Python Bridge 输入队列**：`BoundedQueue<ScoreBatch>`（C++ 实现，不持 GIL）；BatchScheduler 生产、Bridge 消费；满 → BatchScheduler 背压 → KV I/O 池背压 → 最终 Ingress 拒绝；
 - **数据所有权**：阶段间传递张量/记录所有权（move），无共享可变状态；Bridge 传给 Python 的是序列化 bytes（copy），Python 侧 `frombuffer` 零拷贝视图；
 - **乱序与 req 关联**：每请求一个 `promise<ScoreOutcome>`；结果不按提交顺序回填（`req_id` 关联），快请求不被慢请求阻塞。
@@ -896,15 +898,15 @@ Stage II 非自回归（M 候选整批并行、单次前向出全部分数），
 | Ingress | [net/http_server](file:///workspace/cpp/src/net/http_server.cpp) accept + worker 池 + `route_async` | **已实现**：接入线程提交后立即释放，响应由完成线程经 `done` 回调写回（幂等单次） |
 | EmbedLookup | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_lookup` @ `embed_lookup` 池 | **已实现**（IO 池独立分池 + 有界队列背压） |
 | Frontend Encode | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_encode` @ `frontend_encode` 池 | **已实现**（CPU 池独立分池；`lookup_ns`/`encode_ns_with` 两步式接口） |
-| KV I/O | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_kv` @ `kv_io` 池 | **已实现**（IO 池；后端当前为 LocalKVStore，datasystem adapter 待接入） |
+| KV I/O | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `stage_kv` @ `kv_io` 池 | **已实现**（IO 池；后端 `DatasystemKVStore`/`LocalKVStore` 二选一，经 `KVStore` 接口注入） |
 | Stage I Compute | [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `encode_s` @ `stage1_compute` 池 | **已实现**（C++ CPU，对拍通过） |
 | BatchScheduler | [serving/flow.cpp](file:///workspace/cpp/src/serving/flow.cpp) `batch_loop`/`take_batch` | **已实现**（独立攒批线程；等首条→`max_wait` 窗口→满 `max_batch` 出批；miss 前置回填不进计算批） |
 | Python Compute Bridge | [serving/compute_bridge.cpp](file:///workspace/cpp/src/serving/compute_bridge.cpp) + [tools/bridge_score.py](file:///workspace/cpp/tools/bridge_score.py) | **已实现**：嵌入解释器 + 专用线程持 GIL 调 `score_batch`（PyTorch CUDA/CPU）；队列满/不可用自动降级 C++ |
 | Stage II 计算 | Python 桥（主）/ [engine/two_stage.cpp](file:///workspace/cpp/src/engine/two_stage.cpp) `score_ns_batch`（降级） | **已实现**（双后端：python/cpp 数值均对拍 golden < 1e-5） |
-| folly 阶段串联 | [common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) + SEDA 阶段链 | **已实现**（folly 语义等价物：功能分池 + 有界 FIFO + `ExecutorOverloaded` 快速失败；工程环境无 folly 依赖时零成本替换） |
-| datasystem adapter | [kv/store](file:///workspace/cpp/src/kv/store.cpp) LocalKVStore | 本地参考实现已有；**待接入 datasystem set/get** |
+| folly 阶段串联 | [common/executor.cpp](file:///workspace/cpp/src/common/executor.cpp) + SEDA 阶段链 | **已实现**（真实 folly `CPUThreadPoolExecutor`/`IOThreadPoolExecutor` 功能分池 + 有界背压 `ExecutorOverloaded` 快速失败） |
+| datasystem adapter | [kv/datasystem_store.cpp](file:///workspace/cpp/src/kv/datasystem_store.cpp) DatasystemKVStore | **已实现**（调 datasystem C++ SDK `KVClient` `Set/Get/Del/Expire`；`ONETRANS_WITH_DATASYSTEM` 条件编译，缺失回退 LocalKVStore） |
 
-**演进路径**：① ~~引入 folly 分池与 Future 串联（编排 C++ 化）~~ **已完成**（`Executor`/`ThreadPoolExecutor`/`ExecutorSet` + `ScoreFlow` SEDA 阶段链）；② 接入 datasystem（KV 外置）——**待做**（`LocalKVStore` 已满足接口契约 `put`/`get`/`mget`/`del`）；③ ~~新增 Python Compute Bridge（Stage II 计算换 CUDA）~~ **已完成**（`--compute-backend auto|python|cpp`，`auto` 优先 python、失败/队列满降级 cpp）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
+**演进路径**：① ~~引入 folly 分池与 Future 串联（编排 C++ 化）~~ **已完成**（`Executor`/`ThreadPoolExecutor`/`ExecutorSet` + `ScoreFlow` SEDA 阶段链）；② 接入 datasystem（KV 外置）——**已完成**（`DatasystemKVStore` 调 datasystem C++ SDK，`LocalKVStore` 回退）；③ ~~新增 Python Compute Bridge（Stage II 计算换 CUDA）~~ **已完成**（`--compute-backend auto|python|cpp`，`auto` 优先 python、失败/队列满降级 cpp）；④ Stage I 保持 C++ CPU 不动。每步以 `verify_golden` + `e2e_test` 守护不回归。
 
 ### 7.5 关键数据结构
 

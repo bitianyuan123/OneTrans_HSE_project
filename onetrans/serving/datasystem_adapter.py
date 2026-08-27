@@ -8,6 +8,13 @@
 注意：本模块 import 即惰性，SDK 缺失时不 crash（仅在使用时报错），
 以便在无 yuanrong 环境（如本仓库 CI）下仍可运行其余端到端路径。
 
+**性质：本文件属 Python 参照实现（`onetrans/serving/`），仅供一次性生成
+``golden.bin`` 与教学/协议参照，不构成生产热路径，也不是正确性验证基准。**
+
+生产路径的 KV 读写走 **C++ SDK**（`cpp/src/kv/datasystem_store.cpp` 的
+``DatasystemKVStore``，调 ``datasystem::KVClient`` 的 ``Set/Get/Del/Expire``），
+本文件（``YuanrongKVStore``）不在在线热路径上调用 datasystem。
+
 对应设计文档 §1.4 / §1.5。
 """
 

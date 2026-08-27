@@ -38,28 +38,50 @@ struct UserKVRecord {
     std::string checksum() const;  // sha256 hex
 };
 
-class LocalKVStore {
+// KV 存储统一逻辑接口（存储无关）。nearline/online 编排层只依赖本接口，
+// 具体后端二选一：LocalKVStore（进程内）或 DatasystemKVStore（datasystem C++ SDK）。
+// 与 onetrans/serving/kv_store.py 的 KVStore 协议对齐（§1.3）。
+class KVStore {
+public:
+    virtual ~KVStore() = default;
+
+    // 全量写入（幂等覆盖）
+    virtual bool put(const UserKVRecord& rec) = 0;
+
+    // TTL 过期 / 不存在返回 nullptr
+    virtual std::shared_ptr<const UserKVRecord> get(const KVKey& key) = 0;
+
+    // 批量读（保持顺序；miss 位置为 nullptr）
+    virtual std::vector<std::shared_ptr<const UserKVRecord>> mget(
+        const std::vector<KVKey>& keys) = 0;
+
+    virtual int del(const std::vector<KVKey>& keys) = 0;
+
+    // seconds<=0 表示永不过期
+    virtual void ttl(const KVKey& key, int64_t seconds) = 0;
+
+    virtual size_t size() = 0;
+
+    // 主动回收过期键，返回回收数（后端不支持则返回 0）
+    virtual int sweep() = 0;
+
+    // 后端标识（观测 / healthz）
+    virtual const char* backend() const = 0;
+};
+
+class LocalKVStore : public KVStore {
 public:
     explicit LocalKVStore(int64_t default_ttl_seconds = 0) : default_ttl_(default_ttl_seconds) {}
 
-    // 全量写入（幂等覆盖）
-    bool put(const UserKVRecord& rec);
-
-    // TTL 过期返回 nullopt（惰性淘汰）
-    std::shared_ptr<const UserKVRecord> get(const KVKey& key);
-
-    // 批量读（保持顺序；miss 位置为 nullptr）
-    std::vector<std::shared_ptr<const UserKVRecord>> mget(const std::vector<KVKey>& keys);
-
-    int del(const std::vector<KVKey>& keys);
-
-    // 对已有键设置 TTL（expire_at 为 unix 秒；seconds<=0 表示永不过期）
-    void ttl(const KVKey& key, int64_t seconds);
-
-    size_t size();
-
-    // 主动回收过期键，返回回收数
-    int sweep();
+    bool put(const UserKVRecord& rec) override;
+    std::shared_ptr<const UserKVRecord> get(const KVKey& key) override;
+    std::vector<std::shared_ptr<const UserKVRecord>> mget(
+        const std::vector<KVKey>& keys) override;
+    int del(const std::vector<KVKey>& keys) override;
+    void ttl(const KVKey& key, int64_t seconds) override;
+    size_t size() override;
+    int sweep() override;
+    const char* backend() const override { return "local"; }
 
 private:
     struct Entry {

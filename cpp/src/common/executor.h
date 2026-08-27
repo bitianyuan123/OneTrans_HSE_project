@@ -1,22 +1,21 @@
-// SEDA 线程池执行器（§7.4.2）。
+// SEDA 功能分池执行器（§7.4.2）——基于 folly 线程池，不再维护自研 std::thread 池。
 //
-// 对齐 folly 语义的最小实现（工程环境无 folly 依赖时的等价物）：
-// - Executor                ≈ folly::Executor（add 派发一个任务）
-// - ThreadPoolExecutor      ≈ folly::IOThreadPoolExecutor / CPUThreadPoolExecutor
-//   （IO 池与 CPU 池共用实现；语义差异由实例命名/线程数/队列容量体现：
-//    IO 池线程数少、承接阻塞式网络调用；CPU 池线程数=核、承接计算）
-// - 有界 FIFO + 满时快速失败（ExecutorOverloaded）：背压信号逐级上传至接入层，
-//   防止单池无界堆积拖垮整体时延（§7.4.7 SEDA 契约）。
+// 引入 folly（CPUThreadPoolExecutor / IOThreadPoolExecutor）承接任务调度：
+// - IO 池（EmbedLookup / KV I/O）→ folly::IOThreadPoolExecutor，承接阻塞式网络/外部调用；
+// - CPU 池（Frontend Encode / Compute）→ folly::CPUThreadPoolExecutor（有界队列），承接计算；
+// - Executor                 ：统一 add/stop 句柄，屏蔽两类 folly 执行器的差异；
+// - 有界背压（ExecutorOverloaded）：add 前以 getPendingTaskCount() 与容量快照判定，
+//   超限快速失败，信号逐级上传至接入层，防止单池无界堆积拖垮整体时延（§7.4.7 SEDA 契约）。
 #pragma once
 
-#include <condition_variable>
-#include <deque>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
+
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace onetrans {
@@ -27,46 +26,42 @@ struct ExecutorOverloaded : std::runtime_error {
         : std::runtime_error("executor '" + name + "' queue full") {}
 };
 
+// folly 执行器句柄：统一 add/stop 接口 + 容量背压（快照式软判定）。
 class Executor {
 public:
-    virtual ~Executor() = default;
-    // 队列满抛 ExecutorOverloaded（快速失败，不阻塞提交线程）
-    virtual void add(std::function<void()> fn) = 0;
-};
+    // io=true → IOThreadPoolExecutor；否则 CPUThreadPoolExecutor
+    Executor(std::string name, int num_threads, size_t queue_capacity, bool io);
+    ~Executor();
 
-class ThreadPoolExecutor : public Executor {
-public:
-    ThreadPoolExecutor(std::string name, int num_threads, size_t queue_capacity);
-    ~ThreadPoolExecutor() override;
+    // 队列满抛 ExecutorOverloaded（快速失败）；已 stop 抛 logic_error
+    void add(std::function<void()> fn);
 
-    void add(std::function<void()> fn) override;
+    // 停机：先置 stopped_ 拒收，再 join 排空在途任务并回收线程
     void stop();
+
     const std::string& name() const { return name_; }
-    size_t pending() const;
-    size_t threads() const { return threads_.size(); }
+    bool is_io() const { return io_; }
 
 private:
-    void loop();
-
     std::string name_;
     size_t cap_;
-    std::vector<std::thread> threads_;
-    std::deque<std::function<void()>> q_;
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
+    bool io_;
     bool stopped_ = false;
+    std::mutex mu_;  // 保护 stopped_ 与容量判定（软背压，非强一致）
+
+    std::shared_ptr<folly::CPUThreadPoolExecutor> cpu_;
+    std::shared_ptr<folly::IOThreadPoolExecutor> io_exec_;
 };
 
 // 功能分池集合（§7.4.2 表格的实例化；持有并统一停机）
 class ExecutorSet {
 public:
-    // name/io 线程/cap 逐池构建；线程数 ≤0 时取 1
-    std::shared_ptr<ThreadPoolExecutor> make(const std::string& name, int num_threads,
-                                             size_t queue_capacity);
+    std::shared_ptr<Executor> make(const std::string& name, int num_threads,
+                                   size_t queue_capacity, bool io);
     void stop_all();
 
 private:
-    std::vector<std::shared_ptr<ThreadPoolExecutor>> pools_;
+    std::vector<std::shared_ptr<Executor>> pools_;
     std::mutex mu_;
 };
 
