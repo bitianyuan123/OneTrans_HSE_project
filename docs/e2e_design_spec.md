@@ -1,6 +1,7 @@
 # 序列 Transformer 精排（OneTrans 类）端到端设计说明书
 
 > 版本：v0.1（概要设计）
+> 文档类别：**② 端到端设计（概要）**——只依据设计意图给出系统边界、数据 fabric 与设计决策 D1~D6；详细设计见 [detailed_design.md](./detailed_design.md)，模型层见 [model_design.md](./model_design.md)，现状与差距见 [implementation_status.md](./implementation_status.md) / [gap_analysis.md](./gap_analysis.md)。
 > 目标：以工业集群为研究对象，刻画「序列 Transformer 精排」的负载特征、端到端时延、硬件资源利用率与性能瓶颈。
 
 ---

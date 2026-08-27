@@ -1,6 +1,6 @@
 // 独立稀疏参数服务器（PS）——brpc + bthread（M:N）参考实现。
 //
-// 设计要点（对应 docs/engineering_design.md「线程模型」与「参数服务」章节）：
+// 设计要点（对应 docs/detailed_design.md §4.5「稀疏 PS 数据面契约」与 §7.4「线程与并发模型」）：
 // - 稀疏表按 id 稳定哈希切分为 N 个分片，每分片一把细粒度锁（无全局锁，QPS 随核扩展）；
 // - 分片路由统一 Knuth 乘法哈希（detail::ShardOf 为唯一标准，Python 侧
 //   embedding_ps_client.py 的 ShardedEmbeddingTable.shard_of 与其逐位对齐，G10）；

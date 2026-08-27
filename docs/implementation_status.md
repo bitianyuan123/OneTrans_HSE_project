@@ -1,8 +1,8 @@
 # 实现 & 现状总结
 
-> 版本：v0.4（四次修订：M5 正确性收口完成）
+> 版本：v0.5（五次修订：文档三分体系确立，吸收原《工程级详细设计》的「现状+缺口」内容）
 > 分支：`feat/onetrans-e2e-serving`
-> 对应用户诉求：梳理「工程级详细设计」与「实现 & 现状」两份文档，评估与工程级推荐系统精排的差距。
+> 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；模型层见 [model_design.md](./model_design.md)；端到端设计（原《工程级详细设计》设计内容已并入）见 [detailed_design.md](./detailed_design.md)。
 
 ---
 
@@ -10,7 +10,7 @@
 
 序列 Transformer 精排（OneTrans 类）的**单机参照实现**已完成，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级，见 §5 各「已修复」条目）。
 
-生产侧（C++ brpc / datasystem / 稀疏 PS）以「接口契约 + 参考实现」形式给出：`deploy/ps/`（brpc 分片 PS）、`datasystem_adapter.py`（存储无关 adapter）、`engineering_design.md`（工程级方案）。**剩余差距**集中在可靠性与可观测性（G4/G5）、热路径接线（G7/G9）、C++ 移植（G6），见 §5。
+生产侧（C++ brpc / datasystem / 稀疏 PS）以「接口契约 + 参考实现」形式给出：`deploy/ps/`（brpc 分片 PS）、`datasystem_adapter.py`（存储无关 adapter）、工程级方案固化于 [detailed_design.md](./detailed_design.md) §7（架构/线程模型/部署/可靠性/可观测性）。**剩余差距**集中在可靠性与可观测性（G4/G5）、热路径接线（G7/G9）、C++ 移植（G6），见 §5 与 [gap_analysis.md](./gap_analysis.md)。
 
 ---
 

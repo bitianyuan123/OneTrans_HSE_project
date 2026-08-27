@@ -3,8 +3,7 @@
 > 版本：v0.1
 > 上游：
 > - [端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6、三 fabric）
-> - [详细设计](./detailed_design.md)（KV/Tensor 接口契约、逐组件设计、指标采集点、§8 里程碑 M0~M4）
-> - [工程级详细设计](./engineering_design.md)（软件架构/线程模型/部署/可靠性/可观测性，§11 缺口总表）
+> - [详细设计](./detailed_design.md)（KV/Tensor/PS 接口契约、架构/线程模型/部署/可靠性/可观测性全量系统设计；原《工程级详细设计》已并入该文档）
 > 关联：[实现 & 现状总结](./implementation_status.md)（§5 差距评估：正确性/可靠性/可观测性/工程化/集成落地）
 
 本文对**已识别的剩余差距**做一次收敛性审视后，对**高优先级、尚未实现**的项做必要性分析与可落地的详细设计，并给出分阶段路线图。本文**不写代码**，所有签名/行号以仓库当前代码为准（基线分支 `feat/onetrans-e2e-serving`）。
@@ -15,7 +14,7 @@
 
 ### 1.1 总表
 
-下表重新归类 `implementation_status.md` §5 与 `engineering_design.md` §11 的全部已识别差距，并给出重新评估后的优先级与「是否已被并行工作项处理」。优先级含义：
+下表重新归类 `implementation_status.md` §5 与原《工程级详细设计》缺口总表的全部已识别差距，并给出重新评估后的优先级与「是否已被并行工作项处理」。优先级含义：
 
 - **P1-High**：正确性/可靠性/端到端闭环的硬前提，**必须现在做**（阻断切换 datasystem、阻断线上可运行）。
 - **P1-Mid**：不影响数值正确性，但有明确的负载/灰度/排障缺口，可按依赖顺序**紧随其后的里程碑**做。
@@ -38,7 +37,7 @@
 | G13 | P2 | 工程化 | 无测试框架/CI（`demo.py` 脚本 assert 即回归） | eng §11、imp §5.4 | P2 | 否 |
 | G14 | P2 | 性能 | `_project_ns`/`_apply_ns_ffn` 逐 token 循环、`RingHash` 建环 O(v·n²)、percentile 全样本 | eng §11、imp §5.4 | P2 | 否 |
 
-> 来源缩写：imp = `implementation_status.md`，eng = `engineering_design.md`。
+> 来源缩写：imp = `implementation_status.md`，eng = 原《工程级详细设计》（该文档已退役：设计内容并入 `detailed_design.md` §4.5/§5/§6/§7，缺口与现状内容由本文与 implementation_status.md 承接）。
 
 ### 1.2 与本会话并行工作项的边界
 
@@ -83,7 +82,7 @@
 - **问题本质**：三处路由算法互不等价——KV 分片用 jump 哈希（`/workspace/onetrans/serving/sharded.py` L35、`/workspace/onetrans/serving/router.py` 的 `Router`→`JumpConsistentHash.shard_of`，基于 `hash64` sha256）；worker 分派用 `WorkerPool.worker_for = hash64(key) % num_workers`（`/workspace/onetrans/serving/dispatcher.py` L106-107，取模）；PS 分片用 Knuth（并行项已统一）。`Dispatcher._choose_worker`（`dispatcher.py` L205-211`）在 `mode="hash"` 下直接调 `worker_for`。
 - **若不做的在线后果**：即使 `num_shards == num_workers`，同一 `user_id` 经 jump 哈希与取模得到的桶号**大概率不相同**，导致该 user 的 KV 落在节点 X、其处理 worker 落在节点 Y，每次在线打分都跨节点读 KV。后果：① 数据本地性被破坏，KV 读时延从「本地命中」退化到「跨节点 RDMA/RoCE」，`online.kv_get` p99 显著抬升；② 扩缩容时取模法**全量 remap**（近 100% 键迁移），而 jump 哈希 remap 仅 ~1/k（`demo.py` 实测 8→9 桶 remap≈0.116）。
 - **触发条件**：凡 `mode="hash"` 且 `num_workers>1` 即触发；`num_shards≠num_workers` 时进一步叠加分片粒度不一致。
-- **影响面**：所有高 QPS 在线打分链路，直接决定「KV 与 worker 同节点共存」这个核心架构收益（`engineering_design.md` §2.2）是否成立。
+- **影响面**：所有高 QPS 在线打分链路，直接决定「KV 与 worker 同节点共存」这个核心架构收益（`detailed_design.md` §7.9）是否成立。
 - **为什么现在必须做**：它是 G7 端到端接线与后续 scale-out 的**路由统一底座**；改动小（收敛到同一 `Router`）、收益大（本地性 + 最小 remap），且是避免「上线即跨节点风暴」的硬前提，故 **P1-High**。
 
 ### 2.4 G4：可靠性四件套缺失（超时/重试&幂等/熔断限流/健康检查优雅停机）
@@ -105,7 +104,7 @@
 ### 2.6 G6：无 C++ Nearline/Online 热路径 worker
 
 - **问题本质**：两阶段 brpc 分离部署目前仅 **PS**（`/workspace/deploy/ps/`）有 C++ 参考实现；Stage I/II 热路径与混合参数化层（`/workspace/onetrans/nn/attention/mixed_attention.py` 的 `MixedCausalSelfAttention`、`/workspace/onetrans/nn/ffn/mixed_ffn.py` 的 `MixedFFN` 的逐 token `W_ns_list`/`networks_ns_list`）仍只在 Python（`/workspace/onetrans/serving/two_stage.py`）运行，未移植 vLLM 自定义 op。
-- **若不做的在线后果**：生产高 QPS 下的时延/吞吐由 Python 解释器与逐 token 循环决定，无法达到 brpc+bthread 的确定性低时延与横向扩展；`engineering_design.md` §1 的「C++ 生产 / Python 基准」分工只完成了一半，两阶段分离部署停留在设计态。
+- **若不做的在线后果**：生产高 QPS 下的时延/吞吐由 Python 解释器与逐 token 循环决定，无法达到 brpc+bthread 的确定性低时延与横向扩展；`detailed_design.md` §6.1 的「C++ 生产 / Python 基准」分工只完成了一半，两阶段分离部署停留在设计态。
 - **触发条件**：负载压测/生产切流时暴露。
 - **影响面**：全体热路径（`encode_s`/`score_ns`/`score_ns_batch`），是「单卡参照已通 → 集群落地」的最后形态。
 - **为什么现在必须做 / 可后置**：工程量大、依赖 vLLM 自定义 op 与昇腾/GPU 环境，**可分阶段后置**；但每阶段必须以 Python 为黄金数值基准。排 **P1-Mid**，作为最后一个里程碑（M8）分 M8a→M8c 三层推进，M7 的端到端正确链路（Python）先闭环。
@@ -156,7 +155,7 @@
 
 #### 为什么 `per_layer_len` 必须在 shape 之外显式编码
 
-`K_s^l` 的 `shape[1]` 是 pyramid 该层的**满宽 `dims[l]`**（恒定），而左 padding 语义下「有效 token 数」=`per_layer_len[l]` ≤ `dims[l]`。二者不相等，故**只靠 shape 无法区分左 padding**，必须显式存储有效长度（这正是 `engineering_design.md` §5.3 所指缺陷）。`s_len` 是原始历史有效长度，用于 `append` 的 offset 语义；每层 `per_layer_len[l]` 用于该层交叉注意力掩码。
+`K_s^l` 的 `shape[1]` 是 pyramid 该层的**满宽 `dims[l]`**（恒定），而左 padding 语义下「有效 token 数」=`per_layer_len[l]` ≤ `dims[l]`。二者不相等，故**只靠 shape 无法区分左 padding**，必须显式存储有效长度（这正是 `detailed_design.md` §5.2 风险 R-1 所指缺陷）。`s_len` 是原始历史有效长度，用于 `append` 的 offset 语义；每层 `per_layer_len[l]` 用于该层交叉注意力掩码。
 
 #### 候选方案
 

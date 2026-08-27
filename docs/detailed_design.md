@@ -1,21 +1,30 @@
-# 序列 Transformer 精排系统 详细设计
+# 序列 Transformer 精排系统 · 端到端详细设计
 
-> 版本：v0.4（四次修订：**架构主视图切换为 C++/brpc 生产形态（§7.1.1）**，Python 参照实现降级为正确性 harness 并补 GIL 影响的诚实分析（§7.1.2）；v0.3 建立「业务诉求 → 需求分析 → 输入输出 → 功能设计 → 实现分析 → 实现思路 → 实现设计」全链路结构）
+> 版本：v1.0
+> 文档类别：**② 端到端设计**——**只依据设计意图**描述系统应该是什么样：业务诉求、需求分析、输入输出、功能设计、实现分析与实现设计。
+> 边界约定：本文**不含**实现进度、已实现/未实现标注、差距与里程碑（一律见 [implementation_status.md](./implementation_status.md) / [gap_analysis.md](./gap_analysis.md)）；模型结构/训练/等价性论证等算法层内容见 [model_design.md](./model_design.md)。
 > 上游：[端到端设计说明书](./e2e_design_spec.md)（概要边界与决策 D1~D6）
-> 下游关联：[工程级详细设计](./engineering_design.md)（部署/线程模型生产形态）、[差距分析](./gap_analysis.md)（G1~G14）、[实现 & 现状](./implementation_status.md)
-> 本文以仓库 `feat/onetrans-e2e-serving` 分支当前代码为准（M5 正确性收口已完成）。
+> 交付依赖：本文所有组件均为**目标设计**，落地顺序与验收状态以现状文档为准。
 
 ---
 
 ## 0. 文档结构与阅读导航
 
+**文档三分体系**（严格按内容类别划分，互不混杂）：
+
+| 类别 | 文档 | 内容 |
+|---|---|---|
+| ① 模型层 | [model_design.md](./model_design.md) | 模型结构、计算逻辑、训练、两阶段等价性、正确性验证方法学 |
+| ② 端到端设计 | [e2e_design_spec.md](./e2e_design_spec.md)（概要）+ **本文**（详细） | 只依据设计意图的系统设计：架构/数据流/线程模型/契约 |
+| ③ 现状 & 差距 | [implementation_status.md](./implementation_status.md) + [gap_analysis.md](./gap_analysis.md) | 已实现/未实现、实测结果、差距分级与路线图 |
+
 | 读者 | 关注章节 |
 |---|---|
 | 产品/业务方 | §1 业务诉求、§2 需求分析、§3 输入输出 |
-| 算法工程师 | §4.2 核心算法、§6.2 两阶段等价性论证 |
-| 存储工程师 | §4.3 KV 接口契约、§7.6 关键数据结构、§7.7 序列化布局 |
-| 后端/并发工程师 | **§7.1.1 生产架构（主视图）**、**§7.4 线程与并发模型**（含具体请求端到端走读） |
-| 交付负责人 | §5 实现分析、§8 实现状态对照与差距 |
+| 算法工程师 | model_design.md（全文）、§4.2 两阶段系统映射 |
+| 存储工程师 | §4.3 KV 接口契约、§7.5 关键数据结构、§7.6 序列化布局 |
+| 后端/并发工程师 | **§7.1 生产架构（主视图）**、**§7.4 线程与并发模型**（含具体请求端到端走读） |
+| 交付负责人 | model_design.md §6（验证矩阵）+ ③ 类文档（验收状态） |
 
 约定符号：`D=d_model`，`H=num_heads`，`d=head_dim=D/H`，`L=num_blocks`，`Ns=ns_tokens_num`，`S_len` 有效序列长度，`M` 单请求候选数，`B` batch 维，`ΔL` 增量行为条数。
 
@@ -81,16 +90,16 @@
 
 | 编号 | 维度 | 指标/要求 | 验证方式 |
 |---|---|---|---|
-| NFR-1 | 正确性 | 两阶段拼接与单前向**数值等价**，max\|diff\| < 1e-4 | `demo.py:test_equivalence`（实测 ≤6.7e-8） |
-| NFR-2 | 正确性 | KV 元数据（s_len/per_layer_len）跨后端不丢失 | `test_serialize_roundtrip`（左 padding 用户） |
-| NFR-3 | 一致性 | 并发 append 不静默丢写；冲突显式拒绝 | `test_append_conflict`（offset_conflict + cas_conflict） |
-| NFR-4 | 时延 | 打分 p50/p99/p999 可测、可分解到阶段（kv_get / encode_stage2） | `ServingMetrics.timing` 埋点 |
-| NFR-5 | 吞吐 | 攒批窗口内满批聚合；B=1 与逐条打分数值一致 | `test_dynamic_batching` |
-| NFR-6 | 可用性 | KV miss 不硬失败（全零降级）；权重缺失 seed 兜底；队列满快速拒绝 | `test_kv_miss` / `test_weight_loader` / `test_dispatcher` |
-| NFR-7 | 可扩展 | 节点增减 remap 比例 O(k/n)（jump 哈希），非全量迁移 | `test_routing_sharding`（8→9 桶 remap=0.116） |
-| NFR-8 | 数据本地性 | 同一 user 的 KV shard 与处理 worker 同桶 | `worker_for(uid) == Router.route(uid)` |
-| NFR-9 | 可观测 | 每阶段埋点：nearline.encode_stage1 / online.kv_get / online.encode_stage2 等 | `demo.py` metrics 快照 |
-| NFR-10 | 零拷贝 | 序列化读侧 `frombuffer` 视图；mmap 后端读侧免二次拷贝 | `test_zero_copy` |
+| NFR-1 | 正确性 | 两阶段拼接与单前向**数值等价**，max\|diff\| < 1e-4（容差分级见 model_design §6.2） | 等价性断言（验证矩阵 V1） |
+| NFR-2 | 正确性 | KV 元数据（s_len/per_layer_len）跨后端不丢失 | 序列化 roundtrip 断言（左 padding 用户） |
+| NFR-3 | 一致性 | 并发 append 不静默丢写；冲突显式拒绝 | append 冲突断言（offset_conflict + cas_conflict） |
+| NFR-4 | 时延 | 打分 p50/p99/p999 可测、可分解到阶段（kv_get / encode_stage2） | `timing` 埋点 |
+| NFR-5 | 吞吐 | 攒批窗口内满批聚合；批量与逐条打分数值一致 | 批量等价断言（验证矩阵 V2） |
+| NFR-6 | 可用性 | KV miss 不硬失败（全零降级）；权重缺失 seed 兜底；队列满快速拒绝 | miss/权重/背压用例（V6） |
+| NFR-7 | 可扩展 | 节点增减 remap 比例 O(k/n)（jump 哈希），非全量迁移 | 路由 remap 断言 |
+| NFR-8 | 数据本地性 | 同一 user 的 KV shard 与处理 worker 同桶 | `worker_for(uid) == Router.route(uid)` 断言 |
+| NFR-9 | 可观测 | 每阶段埋点：nearline.encode_stage1 / online.kv_get / online.encode_stage2 等 | 指标快照用例 |
+| NFR-10 | 零拷贝 | 序列化读侧 `frombuffer` 视图；mmap 后端读侧免二次拷贝 | 零拷贝断言 |
 
 ### 2.3 约束与假设
 
@@ -209,54 +218,25 @@ E4 模型发布（checkpoint/表） ─▶ fabric ③ 元数据/版本面（注�
     └── F5.3 权重版本化加载（checkpoint/seed）
 ```
 
-### 4.2 核心算法说明
+### 4.2 核心算法与两阶段系统映射（算法详见 [model_design.md](./model_design.md)）
 
-#### 4.2.1 OneTrans 模型结构
+模型结构（OneTrans：L×CoreOneTransBlock、混合参数化、金字塔降层、tokenizer）与两阶段等价性论证（不变量 I1~I3）属模型层内容，**统一见 [model_design.md](./model_design.md)**。此处只保留驱动 serving 设计的系统映射：
 
-`L` 个 `CoreOneTransBlock` 堆叠（pre-norm 残差），每个 block：
-
-```
-h  = RMSNorm(x)
-a  = MixedCausalSelfAttention(h, mask)        # 混合参数化注意力
-z  = x + a                                    # 残差 1
-z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
-# pyramid 降层：保留尾部（最新）out_seq_num 个 S token + 全部 Ns 个 NS token
-```
-
-**混合参数化（Mixed Parametrization）**——本模型与普通 Transformer 的本质差异：
-
-| token 类别 | attention 投影 | FFN | 物理含义 |
-|---|---|---|---|
-| S token（行为历史） | 共享 `W_s`（一个 QKV 融合投影） | 共享 `network_s` | 历史行为同质，参数共享 |
-| NS token（候选/上下文/画像，第 i 个） | 独立 `W_ns_list[i]` | 独立 `networks_ns_list[i]` | 各 NS token 语义异构，逐 token 参数化提升表达力 |
-
-代码：`onetrans/nn/attention/mixed_attention.py`（`W_s`、`W_ns_list`、`final_proj`）、`onetrans/nn/ffn/mixed_ffn.py`。
-
-**金字塔降层（Pyramid）**：每 block 把 S 序列宽度从 `dims[l]` 缩到 `dims[l+1]`（线性 `torch.linspace(max_seq, min_seq, L+1)` 或对数），**保留尾部最新 token**（`z[:, s_in-out_seq_num : s_in, :]`，论文 §3.4 tail index set），NS token 恒取末尾 `ns_tokens_num` 个不参与缩层。配合左 padding：padding 在头部，剪裁丢弃的首先是 padding，有效 token 的「最新」语义得以保留。
-
-#### 4.2.2 两阶段拆分（对应 LLM prefill/decode）
-
-| 维度 | LLM | 本系统 |
+| 维度 | LLM 推理 | 本系统 |
 |---|---|---|
-| 第一阶段 | prefill（全 prompt） | **Nearline**：S 侧编码 + 缓存逐层 K/V |
-| 第二阶段 | decode（逐 token 自回归） | **Online**：NS 编码 + 逐层交叉注意力（**并行非自回归**） |
-| 共享态 | KV cache | **UserKV**（S 侧 K/V，fabric ②） |
-| 拆分收益 | 避免重复 prefill | 用户历史编码一次、打分多次摊销 |
+| 第一阶段 | prefill（全 prompt） | **Nearline（Stage I）**：S 侧逐层编码 + 缓存每层 `(K_s^l, V_s^l)` |
+| 第二阶段 | decode（逐 token 自回归） | **Online（Stage II）**：NS 逐层交叉注意力打分（**并行非自回归**） |
+| 共享态 | KV cache | **UserKV**（S 侧逐层 K/V，fabric ②） |
+| 摊销收益 | 避免重复 prefill | 用户历史编码一次、打分多次摊销 |
 
-**拆分成立的前提**（正确性论证）：S token 位于序列前段且严格因果，其隐藏态与 K/V **与 NS 无关**（NS 在序列尾部，不进入任何 S 位置的因果窗口）。因此：
-1. S 侧 K/V 可安全预计算（`encode_s` 与单前向对 S 段的计算逐位一致）；
-2. 两阶段拼接（`encode_s` → 存取 → `score_ns`）与单前向 `backbone(cat([s, ns]))` **数值等价**（demo 校验 max|diff| ≤ 6.7e-8，fp32 下）。
+**等价性成立 ⟹ 工程拆分合法**：S 段 K/V 与 NS 无关（因果隔离）且可预计算，故可把 O(S_len×L) 编码移出在线关键路径——这是本系统一切存储/路由/并发设计的算法前提（论证见 model_design §4）。
 
-**与 LLM 的关键差异**：第二阶段无 sequential 依赖，M 候选整批并行（`score_ns` 的 B 维即 M），瓶颈是「KV 读取带宽 + 交叉注意力算力」而非「逐 token 时延」；故**无需 PD 分池**，而是 KV shard 与 online worker **同节点共存**（一致性哈希同桶）以最大化数据本地性。
+**与 LLM 推理服务的关键差异**：第二阶段无 sequential 依赖，M 候选整批并行，瓶颈是「KV 读取带宽 + 交叉注意力算力」而非「逐 token 时延」；故**无需 PD 分池**，而是 KV shard 与 online worker **同节点共存**（一致性哈希同桶）以最大化数据本地性。
 
-#### 4.2.3 注意力掩码（左 padding 语义的正确性核心）
-
-| 掩码 | 形状 | 语义 |
-|---|---|---|
-| `_s_attn_mask(s_mask)` | `[B,1,S,S]` | S 侧自注意力：列 padding 掩码（无效 key 列 -inf）+ 上三角因果 |
-| `_cross_attn_mask(s_mask, ns_len)` | `[B,1,Ns,S+Ns]` | NS→(S∥NS)：S 列只按 padding 掩码（NS 可看全部有效历史）；NS 列按因果掩码（NS 内自回归式三角） |
-
-左 padding 下有效长度元数据 `per_layer_len[l]` 是掩码的唯一依据——K/V 张量的 `shape[1]` 是 pyramid 满宽 `dims[l]`（恒定），无法从 shape 区分有效 token 数（这正是 G1 元数据固化的动因）。
+**对工程契约的算法约束**（来自模型形态，工程必须遵守）：
+1. 左 padding：有效 token 在尾部 ⟹ 掩码/有效长度/剪裁方向全部由此推导；
+2. 逐层 `S_l = dims[l]` 不同（pyramid）⟹ 序列化必须携带**每层有效长度**元数据（§4.3/§7.6 的契约动因）；
+3. NS 逐 token 独立投影 ⟹ 在线算子是「逐 token 小 GEMM 序列」，批量化设计（§7.3.3）必须保持形状一致。
 
 ### 4.3 KV 存储接口契约
 
@@ -272,17 +252,34 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 | `ttl` | `KVKey, seconds` | — | — | — |
 | `prefetch` | keys + dest(hbm/dram) | 零拷贝引用（ObjRef） | — | — |
 
-**append 冲突语义**（乐观并发 + CAS fencing，G2）：服务端依次校验 ① `offset == rec.s_len`（否则 `offset_conflict`）② `expect_checksum` 非空时 `== rec.checksum`（否则 `cas_conflict`）③ 层数匹配（否则 `layer_mismatch`）。冲突显式拒绝，由上层全量 `put` 重建兜底，**绝不静默丢写**。
+**append 冲突语义**（乐观并发 + CAS fencing）：服务端依次校验 ① `offset == rec.s_len`（否则 `offset_conflict`）② `expect_checksum` 非空时 `== rec.checksum`（否则 `cas_conflict`）③ 层数匹配（否则 `layer_mismatch`）。冲突显式拒绝，由上层全量 `put` 重建兜底，**绝不静默丢写**。
 
 **key 规范**：`kv:{b64(model_version)}:{b64(user_id)}`（url-safe base64 去 padding，满足 datasystem 字符集约束）；元数据键 `meta:{同上}`。
 
 ### 4.4 关键功能规格
 
-- **ingest（FR-1）**：`s_emb/s_mask → encode_s → serialize(s_len, per_layer_len) → UserKVRecord → store.put`；埋点 `nearline.encode_stage1`/`nearline.append_kv`/`nearline.events_ingested`/`kv.obj_cnt`。当前为「全量 prefill + put」正确基线，增量 append 通道已就绪。
+- **ingest（FR-1）**：`s_emb/s_mask → encode_s → serialize(s_len, per_layer_len) → UserKVRecord → store.put`；埋点 `nearline.encode_stage1`/`nearline.append_kv`/`nearline.events_ingested`/`kv.obj_cnt`。全量 prefill + put 为基线通道，增量 append 为增强通道（语义见 §4.3）。
 - **score（FR-3/6）**：`get → (None? zeros+kv.miss : decode_record → score_ns)`；埋点 `online.kv_get`/`online.encode_stage2`/`kv.hit`/`kv.miss`/`online.qps`/`online.candidate_throughput`。
 - **score_batch（FR-4/6）**：一次 `mget` + miss/hit 分流（miss 候选全零、hit 候选展平）+ 一次 `score_ns_batch` 前向 + 按展平顺序还原 `[ΣM, T]`。
 - **路由（FR-7）**：`JumpConsistentHash`（Lamping-Veach，O(ln n) 无状态，固定桶数最小 remap）为主；`RingHash`（ketama，128 虚拟节点/物理节点）供动态增删。`hash64 = sha256(key)[:8]` 大端（跨进程稳定，不用 Python 内置 `hash`）。
-- **PS（FR-9）**：分片哈希 Knuth 乘法 `(id * 0x9E3779B97F4A7C15) mod 2^64 mod num_shards`，Python 与 C++ 逐位对齐（G10）；多表注册（`table → ShardedEmbeddingTable`，每表独立 version，G11）；miss → 0 向量 / 客户端确定性 seed 兜底。
+- **PS（FR-9）**：分片哈希 Knuth 乘法 `(id * 0x9E3779B97F4A7C15) mod 2^64 mod num_shards`，Python 与 C++ 逐位对齐（跨语言契约）；多表注册（`table → ShardedEmbeddingTable`，每表独立 version）；miss → 0 向量 / 客户端确定性 seed 兜底。
+
+### 4.5 稀疏 Embedding PS 数据面契约
+
+**设计要点**：
+
+1. **按 id 稳定哈希分片（N 分片，每分片一把锁）**：读写细粒度并发，无全局锁；分片哈希以 Knuth 乘法为**唯一标准**（跨语言逐位对齐，R-5）。
+2. **表版本 `version` 随写递增**：供「权重版本化加载 / 失效校验」；多表（多模型版本）以 `table` 字段区分（R-6）。
+3. **未命中回 0 向量，客户端 seed 兜底哈希嵌入重建**：权重版本化最差路径。
+
+**wire 契约（`embedding_service.proto`）**：
+
+| RPC | 请求字段 | 响应字段 |
+|---|---|---|
+| `Lookup` | `table`（表名/模型版本）、`ids[]`（int64 特征 id）、`dim` | `weights[dim]`（float）、`version`（表版本）、`shard_id` |
+| `BatchLookup` | `table`、`ids[][]` | 同上按批对齐 |
+
+**部署形态**：独立 PS 服务（C++ brpc + bthread），Nearline / Online 两池共享查表（稀疏表可超单机内存，独立服务化避免每实例各持一份）；服务端内部 `TableRegistry: table_name → ShardedEmbeddingTable`（懒建 + 淘汰，每表独立 version_），`DoLookup` 按 `req.table()` 路由。
 
 ---
 
@@ -293,24 +290,24 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 | 决策点 | 候选 | 选择 | 理由 |
 |---|---|---|---|
 | 参照语言 | Python / C++ / Rust | **Python 参照 + C++ 生产** | 先以 Python 固化数值基准（黄金基准），热路径后移 brpc+bthread（确定性低时延、M:N） |
-| 序列化 | pickle / safetensors / 自定义 | **自定义 header + raw bytes** | 禁止 pickle 任意对象（安全 + 跨语言）；header 承载 dtype/shape/有效长度（G1），raw 部分可 frombuffer 零拷贝 |
+| 序列化 | pickle / safetensors / 自定义 | **自定义 header + raw bytes** | 禁止 pickle 任意对象（安全 + 跨语言）；header 承载 dtype/shape/有效长度，raw 部分可 frombuffer 零拷贝 |
 | KV 后端 | Redis / 自研 / datasystem | **KVStore 协议 + 多 adapter** | 存储无关：LocalKVStore（单机基准/mmap 零拷贝）、YuanrongKVStore（生产，HBM/DRAM 多级）、redis（预留） |
-| 路由 | 取模 / jump / ring | **jump 为主 + ring 备** | 取模扩缩容全量 remap（已废弃，G3 教训）；jump 最小 remap 且无状态；ring 支持节点集合任意变化 |
+| 路由 | 取模 / jump / ring | **jump 为主 + ring 备** | 取模扩缩容全量 remap；jump 最小 remap 且无状态；ring 支持节点集合任意变化 |
 | 并发模型 | 全局队列+单锁 / 每 worker 独立队列 | **N 独立有界队列** | 消全局锁：单锁会串行化所有提交（队头阻塞），独立队列 + hash 派发才能横向扩展 |
 | 异步匹配 | 同步阻塞 / 回调 / Future | **Future + req_seq** | 支持乱序完成、超时取消、异常传播；与 brpc Controller/done 回调语义同构 |
 | 攒批 | 固定批 / 请求级 | **FIFO + 满批或超时窗口** | 时延有界（max_wait 兜底）+ 吞吐优先（满批聚合） |
 
-### 5.2 关键实现风险与既有教训
+### 5.2 关键实现风险与设计对策
 
-| 风险/教训 | 本质 | 现状 |
-|---|---|---|
-| R-1 元数据隐性依赖（G1） | `LocalKVStore` 靠 record 对象内联 `s_len/per_layer_len` 才正确；序列化 header 只存 dtype/shape 时，跨后端（datasystem）读写丢失有效长度 → 左 padding 用户在线掩码错误且**静默** | ✅ 已修复：header 显式固化 `s_len`/`layers[].len`，`read_header`/`deserialize_with_meta` 读回，旧数据回退满宽（向后兼容） |
-| R-2 append TOCTOU（G2） | 「读-合并-写」三段式无原子栅栏：并发 append 时后写覆盖先写，**丢写无告警** | ✅ 已缓解：`expect_checksum` CAS fencing，冲突 `cas_conflict` 拒绝；生产可后置 datasystem 原生原子 CAS |
-| R-3 路由不一致（G3） | KV 分片（jump）与 worker 派发（取模 `hash64%n`）哈希不同 → 同一 user 的 KV 与 worker 落不同节点，跨节点读 + 扩缩容全量 remap | ✅ 已修复：`worker_for` 复用同一 `Router`（jump），与分片同桶 |
-| R-4 miss 硬失败（G8） | `store.get` 返回 None 时 `raise KeyError` → 冷启动/TTL 过期/分片迁移等常态事件变成请求失败 | ✅ 已修复：全零 logits + `kv.miss` 打点，单/批一致 |
-| R-5 跨语言哈希不等价（G10） | Python sha256 vs C++ Knuth → PS 读写两侧分片错位 | ✅ 已修复：统一 Knuth，黄金值校验 `shard_of(1234)==2` |
-| R-6 单表 PS（G11） | C++ server 忽略 `req.table()` → 无法多模型版本灰度 | ✅ 已修复：`TableRegistry` 多表 + 每表 version |
-| R-7 数值漂移（未发生） | 两阶段与单前向不等价 | 防御：`test_equivalence` 每次回归；fp32 下实测 ≤6.7e-8 |
+| # | 风险 | 本质 | 设计对策 |
+|---|---|---|---|
+| R-1 | 元数据隐性依赖 | 序列化 header 只存 dtype/shape 时，跨后端读写丢失有效长度 → 左 padding 用户在线掩码错误且**静默** | header 显式固化 `s_len`/`layers[].len` 为契约；旧数据回退满宽（向后兼容）；roundtrip 断言入验证矩阵 |
+| R-2 | append TOCTOU | 「读-合并-写」三段式无原子栅栏：并发 append 后写覆盖先写，**丢写无告警** | `expect_checksum` CAS fencing，冲突显式拒绝；后端具备原子 CAS 时直通 |
+| R-3 | 路由不一致 | KV 分片与 worker 派发哈希不同 → 同一 user 的 KV 与 worker 落不同节点，跨节点读 + 扩缩容全量 remap | worker 派发复用同一 `Router`（jump），与 KV 分片同桶；`num_shards == num_workers` |
+| R-4 | miss 硬失败 | KV miss（冷启动/TTL 过期/分片迁移）为常态事件，硬失败抬高错误率 | 全零 logits + `kv.miss` 打点（单/批一致），上层判定不可用走兜底 |
+| R-5 | 跨语言哈希不等价 | Python 与 C++ 分片哈希不同 → PS 读写两侧分片错位 | 分片哈希以 Knuth 乘法为唯一标准，两侧逐位对齐 + 黄金值校验 |
+| R-6 | 单表 PS | PS 忽略 table 字段 → 无法多模型版本灰度 | `TableRegistry` 多表注册 + 每表独立 version |
+| R-7 | 数值漂移 | 两阶段与单前向不等价（移植/替换算子时） | 等价性断言每次回归；容差分级（model_design §6.2） |
 
 ### 5.3 依赖分析
 
@@ -322,31 +319,25 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 
 ## 6. 实现思路
 
-### 6.1 总体策略：Python 黄金基准 → C++ 生产
+### 6.1 总体策略：Python 黄金基准 → C++ 生产（双轨）
 
 ```
-阶段 A（已完成）                    阶段 B（M8，进行中）
+阶段 A：验证基准（Python）                 阶段 B：生产实现（C++，brpc + bthread）
 ┌──────────────────────┐           ┌──────────────────────────┐
-│ Python 单机参照实现     │  数值对齐   │ C++ 生产（brpc + bthread）   │
-│ ・模型/引擎/存储/并发    │ ────────▶ │ ・PS（已就绪 deploy/ps）     │
-│ ・demo.py 等价性断言    │  1e-4→1e-6 │ ・Nearline/Online worker    │
-│ ・存储无关 KVStore 协议  │           │ ・vLLM 自定义混合参数化 op    │
+│ Python 单机参照实现     │  数值对齐   │ C++ 生产                   │
+│ ・模型/引擎/存储/并发    │ ────────▶ │ ・接入/编排/worker 服务       │
+│ ・等价性断言（验证矩阵）  │  1e-4→1e-6 │ ・PS（独立部署）             │
+│ ・存储无关 KVStore 协议  │           │ ・混合参数化 op（原生/vLLM）   │
 └──────────────────────┘           └──────────────────────────┘
 ```
 
-1. **先数值、后工程**：任何 C++ 移植（M8a 算子→M8b worker→M8c vLLM op）都必须与 Python 基准 `max|diff|` 对齐，Python 实现是黄金基准；
-2. **先正确、后性能**：M5 已完成正确性收口（G1/G2/G3/G8），后续 M6（可靠+观测）→ M7（热路径接线）→ M8（C++ 移植）；
+1. **先数值、后工程**：任何 C++ 移植（算子 → worker/服务 → vLLM op）都必须与 Python 基准 `max|diff|` 对齐，Python 实现是黄金基准（验证方法学见 model_design §6）；
+2. **先正确、后性能**：语义正确性（等价性/一致性/降级）先于性能优化收口；
 3. **契约先行**：存储后端、指标出口、PS wire 协议都以 Protocol/proto 先行固化，实现可替换。
 
-### 6.2 两阶段等价性论证（实现正确性的根基）
+### 6.2 两阶段等价性（算法前提）
 
-单前向：`backbone(cat([s, ns]))` 逐 block 处理 `[s ∥ ns]`。
-两阶段：`encode_s(s)` 只算 S 段（因果掩码保证 NS 不影响 S），缓存每层 `(K_s^l, V_s^l)`；`score_ns(kv, ns)` 在每层以 `K=[K_s^l ∥ K_ns^l]` 做注意力。
-等价性依赖三条不变量（demo 已逐条断言）：
-
-- **I1（因果隔离）**：`_s_attn_mask` 的上三角因果使 S 位置只看 S 前缀 → NS 不进入 S 的感受野；
-- **I2（投影一致性）**：`encode_s` 用 `W_s`（S 共享投影）与单前向对 S 段的投影逐位一致；`score_ns` 用 `W_ns_list[i]` 与单前向对 NS 段一致；
-- **I3（掩码重构一致）**：`score_ns` 从 `per_layer_len[l]` 重构的 `s_mask`（`[zeros(S_l-valid), ones(valid)]`）与 `encode_s` 输入的原始掩码在「层 l 输入宽度下的裁剪」语义一致（pyramid 尾部裁剪同步作用于 token 与 mask）。
+等价性论证与三不变量 I1~I3（因果隔离/投影一致性/掩码重构一致）属模型层内容，**见 [model_design.md §4](./model_design.md)**。对工程的意义：等价性成立是「把 S 编码移出在线关键路径」这一拆分合法性的算法前提；任何破坏 I1~I3 的工程改动（掩码实现、投影复用、序列化裁剪）都直接破坏正确性，必须回归验证矩阵。
 
 ### 6.3 零拷贝数据面思路
 
@@ -381,7 +372,7 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 ║  bthread-per-RPC：M:N 协程调度（无解释器锁，单机十万级并发长连接）          ║
 ║  过载保护：max_concurrency 方法级限流 → 快速拒绝 ELIMIT（背压给调用方）      ║
 ║  超时/取消：Controller.timeout_ms + done 回调链（全链路 deadline 传递）     ║
-║  服务发现：注册中心（模型版本/分片拓扑 → 调用方路由表）          [G9]      ║
+║  服务发现：注册中心（模型版本/分片拓扑 → 调用方路由表）                    ║
 ╚═════════╤══════════════════════════════════════════════════╤═════════════╝
           │ jump(uid) 一致性哈希 = KV 分片桶号（数据本地化前提）  │ 同一哈希域
           ▼                                                    ▼
@@ -401,26 +392,26 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
           ▼                                       ▼
 ╔════════ 数据面（全部 C++ 客户端）═══════════════════════════════════════════╗
 ║  KVStore SDK → datasystem 集群：HBM/DRAM/SSD 多级缓存 + RDMA 零拷贝传输     ║
-║  EmbeddingPSClient → PS 集群（deploy/ps：brpc 多表 + Knuth 分片）✅已就绪   ║
+║  EmbeddingPSClient → PS 集群（独立部署：brpc 多表 + Knuth 分片）          ║
 ║  MetaStore SDK → Redis Cluster（KVPointer + TTL + model_version）           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 ```
 
-**各层实现状态**（诚实标注，避免把目标形态当成已交付）：
+**各层职责**：
 
-| 层 | 生产组件 | 状态 | 说明 |
-|---|---|---|---|
-| 接入层 | Online/Nearline brpc Server | 🔧 待 M8b | 服务入口、限流、超时/取消均未落地 |
-| 编排层 | Dispatcher + mpsc 队列 | ◐ 协议已验证 | 乱序匹配/背压/攒批协议在 Python harness 验证正确（§7.4），C++ 实现待 M8b |
-| 引擎层 | C++ TwoStageRunner | 🔧 待 M8a→M8c | 先算子级移植并对齐 Python 基准（≤1e-6），后 vLLM 自定义 op |
-| 数据面 | PS / KV SDK / Meta SDK | ◐ PS 已就绪 | `deploy/ps`（brpc 多表+Knuth 分片）可部署；KV/Meta 的 C++ SDK 待接 |
-| 存储后端 | datasystem / Redis / MQ | 外部系统 | 经 adapter/SDK 接入，存储后端对上层透明 |
+| 层 | 组件 | 职责要点 |
+|---|---|---|
+| 接入层 | Online/Nearline brpc Server | RPC 入口、bthread 承载、方法级限流、超时/取消、服务注册 |
+| 编排层 | Dispatcher + mpsc 队列 | 路由派发、乱序完成、背压、动态攒批（§7.4） |
+| 引擎层 | TwoStageRunner | 两阶段张量计算、混合参数化 op、算子内并行 |
+| 数据面 | PS / KV SDK / Meta SDK | 存储语义、序列化、分片、元数据（§4.3/§7.5/§7.6） |
+| 存储后端 | datasystem / Redis / MQ | 外部系统，经 SDK 接入，对上层透明 |
 
-**与主流工程级精排的对齐点**：入口为 C++ RPC 服务（非 Python 进程）、协程化 IO（bthread）与真实多线程 worker、C++ 数据面客户端（PS/KV 直连，无 Python 中转）、热路径无解释器参与。Python 在本系统的合理位置只有两处：离线训练/实验，以及（过渡期）数值黄金基准。
+**与主流工程级精排的对齐点**：入口为 C++ RPC 服务（非 Python 进程）、协程化 IO（bthread）与真实多线程 worker、C++ 数据面客户端（PS/KV 直连，无 Python 中转）、热路径无解释器参与。Python 在本系统的合理位置只有两处：离线训练/实验，以及数值黄金基准（§7.1.2）。
 
-#### 7.1.2 参照实现组件视图（Python 单机 harness —— 正确性基准）
+#### 7.1.2 验证基准组件视图（Python harness —— 黄金基准，非生产入口）
 
-当前仓库实际交付形态：算法/协议/契约的验证载体（模块路径即组件名），**不是**生产入口。
+设计定位：算法/协议/契约的**验证载体**（组件名即模块路径），承担黄金基准与契约固化职责；因解释器锁限制，其多线程只用于协议验证、不承载生产性能语义（性能以 §7.1.1 生产视图为准）。各组件的落地状态见 [implementation_status.md](./implementation_status.md)。
 
 ```
                     调用方线程（M 个）                     Nearline 触发源（行为流消费者）
@@ -458,8 +449,8 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 ║  KVStore(Protocol) ◀── build_kv_store(KVConfig) 工厂                                    ║
 ║   ├── LocalKVStore：dict + threading.Lock；mmap 模式 payload 落盘 + ACCESS_WRITE          ║
 ║   │     共享映射（读侧零拷贝）；append=offset+CAS 校验+逐层 cat+重建                        ║
-║   ├── YuanrongKVStore：kv().set/get；get 经 deserialize_with_meta 恢复元数据（G1）        ║
-║   │     append 读-合并-写 + expect_checksum CAS（G2）                                     ║
+║   ├── YuanrongKVStore：kv().set/get；get 经 deserialize_with_meta 恢复元数据       ║
+║   │     append 读-合并-写 + expect_checksum CAS fencing                          ║
 ║   └── ShardedKVStore：jump 哈希分片门面，mget/delete/prefetch 按 shard 聚合               ║
 ║  MetaStore：KVPointer{checksum,s_len,per_layer_len,ts,obj_key} + TTL 惰性过期 + 校验       ║
 ║  EmbeddingPSClient：Knuth 分片查表 + seed 兜底 ◀──▶ deploy/ps（C++ brpc 多表 PS）        ║
@@ -476,31 +467,23 @@ z2 = z + MixedFFN(RMSNorm(z))                 # 残差 2
 ╚════════════════════════╝              ╚═════════════════════════════╝
 ```
 
-**该视图验证什么 / 不验证什么**（GIL 影响的诚实分析）：
+**该视图的职责边界**（为什么 Python 只能是验证载体而非生产实现）：解释器锁（GIL）使纯 Python 计算段（逐层/逐 token 循环）上的多线程完全串行，torch 算子虽在执行期释放锁，但被 Python 循环切碎后单算子太薄、可重叠部分有限——无法支撑并发吞吐与时延 SLO（详细分析见 [implementation_status.md](./implementation_status.md)）。因此 Python 参照实现**只**交付三类结论：
 
-| 环节 | GIL 事实 | 工程后果 |
-|---|---|---|
-| `two_stage.py` 逐层 `for block` / 逐 token `W_ns_list[i]` 循环 | 纯 Python 段全程持 GIL | **N 个 worker 线程在计算段完全串行**——多线程在此无并行收益 |
-| torch CPU 算子 | kernel 执行期释放 GIL | 大算子可重叠；但本实现算子被 Python 循环切碎（cat/逐 token 投影），单算子太薄，重叠收益有限 |
-| KV get/put、序列化 | 部分 C 实现（bytes/memmove） | 仅少量 IO 重叠 |
-| demo「30 请求并发完成」 | 验证 req_seq 匹配/背压/乱序/同 user 串行化 | **是协议正确性结论，不是吞吐/并行性能结论** |
-
-因此 Python 参照实现**只**用于交付三类结论：
-1. **数值黄金基准**：两阶段 vs 单前向等价性（≤6.7e-8）、序列化 roundtrip、append CAS 语义、掩码重构不变量——作为 C++ 移植（M8a）的验收标准；
+1. **数值黄金基准**：两阶段 vs 单前向等价性、序列化 roundtrip、append CAS 语义、掩码重构不变量——作为 C++ 移植的验收标准（验证方法学见 model_design §6）；
 2. **并发协议验证**：req_seq 乱序匹配、有界队列背压、同 user 哈希串行化、攒批窗口语义——语言无关协议在真实并发交错下无竞态；
 3. **契约固化**：KVStore 协议、payload 内存布局、PS wire 协议（proto）、指标语义。
 
-**性能结论（吞吐/QPS/时延 SLO/扩展性）一律以 C++ 生产实现（§7.1.1）为准**，Python harness 的任何性能数字只作回归对照，不得外推。
+**性能结论（吞吐/QPS/时延 SLO/扩展性）一律以 C++ 生产实现（§7.1.1）为准**，Python harness 的性能数字只作回归对照，不得外推。
 
 #### 7.1.3 分层职责与依赖方向
 
-| 层 | 生产实现（目标形态） | 参照实现（Python，已交付） | 职责 | 只依赖 |
+| 层 | 生产实现（目标形态） | 验证基准（Python） | 职责 | 只依赖 |
 |---|---|---|---|---|
-| 接入 | brpc Online/Nearline Server 🔧M8b | —（demo 直接调 Dispatcher） | RPC 入口、限流、超时/取消 | 编排 |
-| 编排 | Dispatcher + mpsc 队列 🔧M8b | dispatcher.py / pipeline.py(BatchScheduler) | 并发调度、攒批、请求生命周期 | 引擎、数据面 |
-| worker | C++ worker 线程 🔧M8b | pipeline.py(Nearline/Online) | 阶段编排、降级、埋点 | 引擎、数据面、指标 |
-| 引擎 | C++ TwoStageRunner 🔧M8a→M8c | two_stage.py | 张量计算（编码/打分） | 模型层 |
-| 数据面 | KV/Meta C++ SDK 🔧；PS ✅deploy/ps | kv_store/serialize/local_adapter/datasystem_adapter/sharded/meta_store | 存储语义、序列化、分片、元数据 | torch（张量字节） |
+| 接入 | brpc Online/Nearline Server | — | RPC 入口、限流、超时/取消 | 编排 |
+| 编排 | Dispatcher + mpsc 队列 | dispatcher.py / pipeline.py(BatchScheduler) | 并发调度、攒批、请求生命周期 | 引擎、数据面 |
+| worker | C++ worker 线程 | pipeline.py(Nearline/Online) | 阶段编排、降级、埋点 | 引擎、数据面、指标 |
+| 引擎 | C++ TwoStageRunner | two_stage.py | 张量计算（编码/打分） | 模型层 |
+| 数据面 | KV/Meta C++ SDK；独立 PS | kv_store/serialize/local_adapter/datasystem_adapter/sharded/meta_store | 存储语义、序列化、分片、元数据 | torch（张量字节） |
 | 横切 | 路由（Knuth/jump 哈希跨语言同构）/ 指标 / 权重 | router.py / metrics.py / weight_loader.py | 路由、指标、权重 | — |
 
 **关键解耦**：worker 只依赖 `KVStore` 协议与 `TwoStageRunner`，不感知后端；后端经 `build_kv_store(KVConfig)` 注入；指标经 `ServingMetrics`（满足 `MetricsSink` 协议可替换）。
@@ -589,7 +572,7 @@ E2 打分请求 ──f5: {uid, mv, M 候选特征}──▶ P3 攒批调度器 
 │                                                            │
 │ ② timing("nearline.append_kv")                              │
 │    payload = serialize(kv.per_layer,                       │
-│              s_len=kv.s_len,          # G1 元数据固化         │
+│              s_len=kv.s_len,          # 元数据固化            │
 │              per_layer_len=kv.per_layer_len)                │
 │    rec = UserKVRecord(key=KVKey(mv,uid), s_len, plen,       │
 │                       dtype, payload, ts, created_at)       │
@@ -613,7 +596,7 @@ E2 打分请求 ──f5: {uid, mv, M 候选特征}──▶ P3 攒批调度器 
 │ ① timing("online.kv_get"): rec = store.get(KVKey)  │
 │    ├─ rec is None?                                  │
 │    │    count("kv.miss")                            │
-│    │    return zeros([M,T])     # G8 降级：合法形状、 │
+│    │    return zeros([M,T])     # miss 降级：合法形状、│
 │    │                              不抛异常            │
 │    │    （上层按全零判定不可用 → 冷启动兜底路径）        │
 │    └─ else count("kv.hit")                          │
@@ -687,7 +670,7 @@ C1 ─submit(r1)─┐                      ┌─submit(r2) C2          submit(
      │是
      ▼
    expect_checksum 非空 且 != rec.checksum ?
-     │是─▶ AppendResult(cas_conflict)         # G2 fencing
+     │是─▶ AppendResult(cas_conflict)         # CAS fencing
      │否
      ▼
    per_layer = deserialize(rec.payload)
@@ -835,7 +818,7 @@ class BatchScheduler:
 | `WorkerPool` N 队列 | `ExecutionQueue`/每 worker 有界队列 + bthread 工作组 | 独立队列消全局锁 |
 | `Future` + `_inflight[req_seq]` | brpc `Controller` + `done` 回调 / `bthread_id` | 异步匹配、乱序完成、超时（timeout_ms） |
 | `try_enqueue` Full → `OverloadRejected` | `max_concurrency` 限流 + 快速拒绝（ELOGOFF/ELIMIT） | 背压 |
-| `_STOP` 哨兵 + `join` | `Server.Stop(...)`（先停收新请求，再 drain 队列） | 优雅停机（生产需补 drain&wait 语义，见 gap G4） |
+| `_STOP` 哨兵 + `join` | `Server.Stop(...)`（先停收新请求，再 drain 队列） | 优雅停机（drain & wait 语义） |
 | `LocalKVStore._lock` | datasystem 后端并发（分片锁/无锁结构） | 存储层承接 |
 | `BatchScheduler` | 服务端 dynamic batching（或 brpc 批量接口 + 合并器） | 满批或超时 |
 
@@ -855,7 +838,7 @@ class KVKey:                    # 逻辑主键（不可变，可哈希）
 class UserKVRecord:             # 跨存储边界的完整对象（序列化形态）
     key: KVKey
     s_len: int                  # 有效历史长度（append 的 offset 基准）
-    per_layer_len: list[int]    # 每层有效 token 数（左 padding 掩码的唯一依据，G1）
+    per_layer_len: list[int]    # 每层有效 token 数（左 padding 掩码的唯一依据，R-1）
     dtype: str                  # "float16" | "bfloat16" | "float32"
     payload: bytes              # §7.7 布局的字节 blob
     seq_ts_last: int = 0        # 最近行为时间戳
@@ -870,7 +853,7 @@ class DeltaKV:                  # 增量 append 载荷
     offset: int                 # 必须等于当前 rec.s_len（乐观校验）
     delta_len: int              # ΔL
     tensors: list[tuple[Tensor, Tensor]]     # 每层 (ΔK_s^l [1,ΔL,H,d], ΔV_s^l)
-    expect_checksum: str = ""   # 非空时要求 == 当前 payload checksum（CAS fencing，G2）
+    expect_checksum: str = ""   # 非空时要求 == 当前 payload checksum（CAS fencing，R-2）
 
 @dataclass
 class PutResult:    accepted: bool; version: str; checksum: str; reason: str = ""
@@ -980,7 +963,7 @@ def append(delta):
         if rec is None:            return AppendResult(missing)
         if delta.offset != rec.s_len:            return AppendResult(offset_conflict)
         if delta.expect_checksum and delta.expect_checksum != rec.checksum:
-                                                return AppendResult(cas_conflict)  # G2
+                                                return AppendResult(cas_conflict)  # R-2
         per_layer = deserialize(rec.payload)
         if len(per_layer) != len(delta.tensors): return AppendResult(layer_mismatch)
         merged = [(cat(K, dK, dim=1), cat(V, dV, dim=1))           # 逐层尾部拼接
@@ -1028,7 +1011,7 @@ payload = <magic 12B> <header_len 4B(LE u32)> <header_json> <raw_bytes>
   magic       = b"ONETRANSKV\x01"
   header_json = {
     "dtype": "float16", "n_layers": L,
-    "s_len": 31,                                  ← G1：有效长度固化（旧数据缺省→满宽）
+    "s_len": 31,                                  ← 有效长度固化（旧数据缺省→满宽）
     "layers": [
       {"l":0, "k_shape":[1,50,4,32], "v_shape":[1,50,4,32], "len":31},   ← 每层有效 len
       {"l":1, "k_shape":[1,28,4,32], "v_shape":[1,28,4,32], "len":27},
@@ -1042,26 +1025,29 @@ raw_bytes = concat(K_s^0, V_s^0, K_s^1, V_s^1, ..., K_s^{L-1}, V_s^{L-1})   # �
 - **写侧零拷贝**：预分配总长 `bytearray`；`ctypes.memmove(buf+offset, t.data_ptr(), n)` 逐张量单次直搬（无中间 bytes 对象、无 O(n²) 拼接）。
 - **读侧零拷贝**：`torch.frombuffer(payload, dtype, count, offset=pos).reshape(shape)` 直接视图；`bytes` 只读、`bytearray/memoryview/mmap` 可写回（与底层共享存储）。
 - **元数据 API**：`read_header`（只解析头部，供 datasystem get/append 免整对象反序列化）、`deserialize_with_meta`（返回 `(per_layer, s_len, per_layer_len)`，旧数据回退满宽）、`per_layer_offsets`（层偏移，供 pyramid@read 部分读取）。
-- **容量量级**（默认配置 fp16、linear dims 100→10、L=6）：`C_kv ≈ 2·H·d·2B · Σdims[l] ≈ 1024·330 ≈ 338 KB/用户`；demo 小配置实测 134,519 B/用户。
+- **容量量级**（默认配置 fp16、linear dims 100→10、L=6）：`C_kv ≈ 2·H·d·2B · Σdims[l] ≈ 1024·330 ≈ 338 KB/用户`。
 
 ### 7.8 可靠性与可观测性设计
 
-| 能力 | 现状（已实现） | 缺口（M6） |
-|---|---|---|
-| 降级 | KV miss → 全零 + `kv.miss`；权重缺失/损坏 → seed 兜底；PS miss → seed 嵌入 | 「陈旧读 + 打点」路径 |
-| 背压 | 有界队列满 → `OverloadRejected`（异步失败） | 令牌桶限流、错误率熔断 |
-| 一致性 | append offset+CAS；pointer checksum 校验；序列化魔数校验 | datasystem 原生原子 CAS |
-| 版本化 | model_version 进 KV key；PS 每表 version；checkpoint 按 mv 命名 | 服务发现/注册中心（G9） |
-| 指标 | `nearline.encode_stage1` / `nearline.append_kv` / `online.kv_get` / `online.kv_mget` / `online.encode_stage2` / `kv.hit|miss` / `kv.obj_cnt` / `online.qps` / `online.candidate_throughput` / `online.batch_size` | Prometheus/OTel 导出、分桶直方图 |
-| 日志/追踪 | — | req_id/trace_id 贯穿、结构化日志 |
-| 优雅停机 | `_STOP` 哨兵 + join | drain&wait（先停收新再排空） |
+| 能力域 | 设计机制 |
+|---|---|
+| 降级 | KV miss → 全零 + `kv.miss` 打点（单/批一致）；权重缺失/损坏 → seed 兜底；PS miss → 确定性 seed 嵌入；上层按全零判定不可用走冷启动兜底 |
+| 背压 | 双层：接入层 `max_concurrency` 方法级限流（快速拒绝）+ 编排层有界队列满 → `OverloadRejected`（异步失败信号，提交方永不被同步阻塞） |
+| 重试与幂等 | 读操作（get/mget）幂等可安全重试；写操作（put 幂等覆盖；append 非幂等靠 offset+CAS 拒绝重放） |
+| 一致性 | append offset+CAS fencing；pointer checksum/s_len/per_layer_len 三者一致才校验通过；序列化魔数校验；后端具备原生原子 CAS 时直通 |
+| 版本化 | model_version 进 KV key；PS 每表独立 version；checkpoint 按 mv 命名；注册中心维护版本→实例路由 |
+| 超时/取消 | 全链路 deadline 传递（Controller.timeout_ms / Future timeout）；过时结果在 `_complete` 处丢弃（pop 后 `fut.done()` 判定） |
+| 熔断/健康 | 按后端（datasystem/PS）错误率熔断 + `/healthz` 依赖探针 |
+| 优雅停机 | 先停收新请求 → 排空队列（drain & wait）→ join；哨兵对象触发 worker 自然退出 |
+| 指标 | `nearline.encode_stage1` / `nearline.append_kv` / `online.kv_get` / `online.kv_mget` / `online.encode_stage2` / `kv.hit|miss` / `kv.obj_cnt` / `online.qps` / `online.candidate_throughput` / `online.batch_size`；导出到 Prometheus/OTel（分桶直方图） |
+| 日志/追踪 | req_id/trace_id/user_id 贯穿 Nearline→Online→PS 的结构化日志与分布式 trace |
 
 ### 7.9 部署视图
 
 ```
                   行为流（按 user 分区）                  打分请求（按 user 路由）
                         │                                     │
- ┌────── Nearline Pool（C++ brpc，M8b）──────┐   ┌────── Online Pool（C++ brpc，M8b）──────┐
+ ┌────── Nearline Pool（C++ brpc 服务）──────┐   ┌────── Online Pool（C++ brpc 服务）──────┐
  │  Stage I：tokenize → S 编码 → put/append  │   │  Stage II：读 KV → NS 编码 → 交叉打分   │
  └──────────────┬───────────────────────────┘   └──────────────┬─────────────────────────┘
                 │ 写（fabric ②）                                │ 读（同 shard，本地命中）
@@ -1075,26 +1061,30 @@ raw_bytes = concat(K_s^0, V_s^0, K_s^1, V_s^1, ..., K_s^{L-1}, V_s^{L-1})   # �
                                                                     └─────────────────────────┘
 ```
 
-扩缩容：jump 哈希 remap O(k/n)（8→9 桶实测 0.116）；`num_shards == num_workers` 维持 KV/worker 同桶共址。
+扩缩容：jump 哈希 remap O(k/n)（仅迁移 k/n 比例对象）；`num_shards == num_workers` 维持 KV/worker 同桶共址。
+
+**为什么 Nearline/Online 分离部署**：
+- **负载形态不同**：近线「写密集、批量尾巴」，在线「读密集、低时延、高 QPS」，拆开可独立扩容/限流/灰度；
+- **稀疏参数独立服务化**：稀疏表可超单机内存，每实例各持一份成倍浪费；独立 PS 供两池共享查表；
+- **UserKV 与 owner 同节点共存**：一致性哈希把 user 路由到 owner，读命中本地缓存，最大化数据本地性。
 
 ---
 
-## 8. 实现状态对照与差距
+## 8. 与现状文档的边界
 
-**已实现并验证（`demo.py` 全绿）**：两阶段数值等价（≤6.7e-8）/ 序列化 roundtrip + 元数据固化（G1）/ append offset+CAS（G2）/ KV miss 降级（G8）/ 路由统一 worker_for==Router.route（G3）/ 零拷贝 / jump remap=0.116 / 元数据 TTL / 分片本地化 / 攒批 + miss/hit 混批 / 30 并发 req_seq 匹配 + 背压 / PS Knuth 跨语言等价（G10）/ 多表（G11）/ 权重版本化。
+本文到此为止均为**目标设计**。各组件/各层的落地状态、实测结果、差距分级与推进路线**一律**见：
 
-**待实现（详见 [gap_analysis.md](./gap_analysis.md)）**：**G6 C++ 生产热路径（M8a 算子 → M8b brpc Online/Nearline 服务 → M8c vLLM 自定义 op）——通往工程级的最高优先级主线，§7.1.1 主视图即其目标形态**；G4 可靠性四件套（超时/重试/熔断/优雅停机，M6）、G5 可观测导出（M6）、G7 tokenizer+embedding 接线（M7）、G9 服务发现/注册（M7）、G12~G14（P2）。Python 参照实现定位为正确性 harness（§7.1.2），性能结论以 C++ 生产实现为准。
-
-**里程碑**：M0~M2、M5 ✅｜M3（负载实验）、M6、M7、M8、M4（基线对比）待做。
+- [implementation_status.md](./implementation_status.md)——已实现与验证内容、分层落地状态、验证结果摘录；
+- [gap_analysis.md](./gap_analysis.md)——差距清单（编号 G1~G14）、必要性分析与里程碑路线图。
 
 ---
 
-## 9. 与其他文档的对应
+## 9. 文档三分体系对应表
 
-| 本文章节 | 对应文档 |
-|---|---|
-| §1~§3 业务/需求/IO | e2e_design_spec.md §1~§2（概要层） |
-| §4.2 算法 | e2e_design_spec.md 算法说明、§6 实现 |
-| §7.4 线程模型 | engineering_design.md「计算面线程模型」（生产形态） |
-| §7.8 可靠/观测 | engineering_design.md §8/§9 |
-| §8 差距 | gap_analysis.md（G1~G14 + 路线图）、implementation_status.md |
+| 类别 | 文档 | 与本文关系 |
+|---|---|---|
+| ① 模型层 | [model_design.md](./model_design.md) | 本文 §4.2 的算法依据（等价性 I1~I3、掩码、pyramid 约束） |
+| ② 端到端设计（概要） | [e2e_design_spec.md](./e2e_design_spec.md) | 本文的上游边界与决策 D1~D6 |
+| ② 端到端设计（详细） | **本文** | 全量系统设计 |
+| ③ 现状 & 差距 | [implementation_status.md](./implementation_status.md) | 本文各组件的落地状态与实测 |
+| ③ 现状 & 差距 | [gap_analysis.md](./gap_analysis.md) | 差距分级、必要性分析与路线图 |

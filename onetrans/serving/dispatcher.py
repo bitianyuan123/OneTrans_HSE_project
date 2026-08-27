@@ -12,7 +12,7 @@
 - **背压**：worker 队列满时拒绝（:class:`OverloadRejected`，可重试/降级）或限时阻塞，
   避免无界排队拖垮 p99 时延。
 
-对应设计文档 ``docs/engineering_design.md`` 的「线程模型」章节；生产 C++ 对应物为
+对应设计文档 ``docs/detailed_design.md`` §7.4 的「线程与并发模型」；生产 C++ 对应物为
 ``brpc::Server + bthread + ExecutionQueue/ThreadPool``。
 """
 
