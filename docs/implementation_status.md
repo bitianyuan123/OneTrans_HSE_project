@@ -1,16 +1,54 @@
 # 实现 & 现状总结
 
-> 版本：v0.5（五次修订：文档三分体系确立，吸收原《工程级详细设计》的「现状+缺口」内容）
+> 版本：v1.0（C++ 工程主线确立；Python 单机参照降为对拍基准）
 > 分支：`feat/onetrans-e2e-serving`
-> 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段（工程可用）执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计（原《工程级详细设计》设计内容已并入）见 [detailed_design.md](./detailed_design.md)。
+> 文档定位（三分体系 ③ 现状 & 差距）：本文记录**已实现/已验证**的落地状态与实测结果；差距分级与路线图见 [gap_analysis.md](./gap_analysis.md)；第二阶段执行设计见 [phase2_design.md](./phase2_design.md)；模型层见 [model_design.md](./model_design.md)；端到端设计见 [detailed_design.md](./detailed_design.md)。
 
 ---
 
-## 1. 现状总览（一页）
+## 0. C++ 工程主线（当前形态）
 
-序列 Transformer 精排（OneTrans 类）的**单机参照实现**已完成，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级，见 §5 各「已修复」条目）。
+**仓库现状**：`cpp/` 下已存在完整的端到端 C++ 实现（`a0c3eb5`，40 文件 / +5787 行），是当前的工程主线。Python 单机参照（`onetrans/`、`demo.py`）保留为**数值对拍基准与教学参照**，不再承接工程演进。
 
-生产侧（C++ brpc / datasystem / 稀疏 PS）以「接口契约 + 参考实现」形式给出：`deploy/ps/`（brpc 分片 PS）、`datasystem_adapter.py`（存储无关 adapter）、工程级方案固化于 [detailed_design.md](./detailed_design.md) §7（架构/线程模型/部署/可靠性/可观测性）。**剩余差距**集中在可靠性与可观测性（G4/G5）、热路径接线（G7/G9）、C++ 移植（G6），见 §5 与 [gap_analysis.md](./gap_analysis.md)。
+### 0.1 已交付（C++ 端到端，零第三方依赖）
+
+| 交付物 | 位置 | 验证 |
+|---|---|---|
+| `onetrans_core` 静态库 | [cpp/src/](file:///workspace/cpp/src)（common/engine/kv/serving/net） | 数值对拍 24/24 PASS |
+| `onetrans_server` HTTP 服务 | [cpp/tools/server_main.cpp](file:///workspace/cpp/tools/server_main.cpp) | e2e 7/7 PASS |
+| `verify_golden` 对拍工具 | [cpp/tools/verify_golden.cpp](file:///workspace/cpp/tools/verify_golden.cpp) | max diff < 1e-6 |
+| 权重/golden 导出 | [cpp/tools/export_weights.py](file:///workspace/cpp/tools/export_weights.py) + `gen_golden.py` | manifest + 二进制落盘 |
+| 端到端测试 | [cpp/tools/e2e_test.py](file:///workspace/cpp/tools/e2e_test.py) | ingest→score→对拍 golden |
+
+### 0.2 实测结果
+
+```
+verify_golden：共 24 项，失败 0 项（C++ vs Python 全链路逐位等价，max diff < 1e-6）
+e2e_test（7/7 PASS）：
+  healthz / ingest(accepted, s_len=37) / score(max diff 2.38e-07 vs golden)
+  / kv_miss 降级全零 / metrics / route 404·405
+```
+
+### 0.3 线程模型现状 → 目标
+
+当前 `cpp/` 已实现「**接入/计算分离 + 攒批**」：`net/http_server` accept 线程 + worker 池负责收发；`serving/pipeline` 的 `Dispatcher` + `BatchScheduler` 用独立 `score_threads` 消费批次做 `score_ns_batch`。**但 lookup/KV/encode 仍在 compute 线程内同步执行**（见 [detailed_design §7.4.9](./detailed_design.md)）。
+
+下一阶段目标：引入 **folly 功能分池 + `folly::Future` 阶段串联**，把 I/O（embedding lookup / KV I/O）与 CPU（encode / score）彻底解耦，达到 §7.4 的目标线程模型：
+
+| 阶段 | 目标池 | 当前落点 | 待办 |
+|---|---|---|---|
+| Ingress | brpc bthread（仅收发+序列化） | `net/http_server`（已分离 accept，但 `/score` 同步 `fut.get()`） | 改异步回调 |
+| EmbedLookup | `IOThreadPoolExecutor` | `embed_lookup`（回调可注入，当前同步） | 迁出独立 I/O 池 |
+| Frontend Encode | `CPUThreadPoolExecutor` | `engine/frontend`（与 compute 同线程） | 迁出独立池 |
+| KV I/O | `IOThreadPoolExecutor` | `kv/store` LocalKVStore（当前同步） | 迁出独立 I/O 池 |
+| Compute | `CPUThreadPoolExecutor`（绑核） | `pipeline` Dispatcher+BatchScheduler | **已分池** |
+| 阶段串联 | folly `Future` + `via(executor)` | 无（同线程串行） | 引入串联 |
+
+---
+
+## 1. 现状总览（Python 参照基准，降级为对拍底座）
+
+序列 Transformer 精排（OneTrans 类）的**单机参照实现**已固化，覆盖「行为流 → 近线 S 侧编码 → UserKV 存储/读取 → 在线 NS 交叉打分」全链路，`demo.py` 通过数值等价性、零拷贝、并发、路由、攒批、权重版本化、PS 数据面等端到端校验。**M5 正确性收口已完成**（G1 元数据固化 / G2 append CAS fencing / G3 路由统一 / G8 KV miss 降级）。该实现的职责现为 C++ 主线的**数值对拍基准**（见 §0）；C++ 主线的接入/数据面/编排见 [detailed_design.md §7.4](./detailed_design.md)。
 
 ---
 

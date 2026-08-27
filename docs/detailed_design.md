@@ -683,146 +683,115 @@ C1 ─submit(r1)─┐                      ┌─submit(r2) C2          submit(
    # 冲突时上层策略：读最新 → 重算增量重试，或全量 put 幂等重建
 ```
 
-### 7.4 线程与并发模型（重点）
+### 7.4 线程与并发模型（C++ 工程主线）
 
-**定位声明**：本节描述的是**语言无关的线程协作协议**（职责/唤醒/协作/乱序匹配）。7.4.1~7.4.6 以 Python 参照实现为载体说明协议语义；生产实现为 C++（brpc bthread + N 个真实 worker 线程，见 7.4.7 映射）。**注意**：Python 受 GIL 限制，其多线程仅验证协议正确性（乱序/背压/同 user 串行化），不提供并行性能——性能语义以 7.4.7 的生产映射为准。
+> 本节为**生产实现的目标线程模型**，以 C++ + folly 执行器 + brpc 接入为载体。Python 单机参照仅用于协议语义验证（乱序/背压/同 user 串行化），不再作为并发主线；其 GIL 限制下的多线程结论不具性能参考价值。
 
-代码位置：[dispatcher.py](file:///workspace/onetrans/serving/dispatcher.py)、[pipeline.py](file:///workspace/onetrans/serving/pipeline.py)（BatchScheduler）。
+#### 7.4.1 设计原则
 
-#### 7.4.1 线程清单与职责
+1. **接入与计算分离**：brpc/bthread 只承担「收连接 → 反序列化请求 → 提交内部流水线 → 等结果 → 序列化响应」，**绝不**在 bthread 内做 embedding 查表 / KV 读写 / 注意力计算。这保证突发流量下接入层不因业务计算阻塞而拖垮 accept。
+2. **功能分池，互不争抢**：按「I/O 密集 vs CPU 密集」「nearline vs online」拆分独立线程池。I/O 池（embedding lookup / KV I/O）用纯 I/O 线程，不会因为远端慢把 CPU 计算线程饿死；CPU 池（两阶段前向）独占计算核。
+3. **SEDA 分阶段流水线**：请求按阶段在池间流转，阶段间用**有界队列**连接，满即背压回传到上游（最终到接入层快速拒绝），防止任何单池无界堆积拖垮整体时延。
+4. **攒批落在重算入口**：Stage II 交叉打分是 CPU 最重的阶段，`BatchScheduler` 设在 Compute Pool 入口，把多请求的 NS 候选聚合为一次 `score_ns_batch` 前向，摊薄权重访存与 kernel launch。
 
-单机参照实现中的线程（以一次服务装配为例）：
+#### 7.4.2 线程池清单（功能分池，folly 执行器）
 
-| # | 线程 | 数量 | 创建方 | 负责的工作 | 实现方式 | 唤醒方式 | 退出方式 |
-|---|---|---|---|---|---|---|---|
-| 1 | 客户端线程 | M（调用方） | 用户代码 | `Dispatcher.submit` 提交请求；随后 `Future.result()` 阻塞等待 | `threading.Thread`（或任意上层线程） | 被 `fut.set_result/set_exception` 内部 Condition 唤醒 | 请求返回即结束 |
-| 2 | Worker 线程 | N（=num_workers，daemon） | `WorkerPool.start()` | 阻塞取本队列请求 → 执行 handler（编码/打分）→ 回调 `_on_done` 完成匹配 | 独立 `threading.Thread`，每线程独享一个 `queue.Queue(maxsize=cap)` | 阻塞在 `q.get()`（内部 not_empty Condition），`put` 时被唤醒 | 收到哨兵对象 `_STOP` 后 `return`，外层 `join()` |
-| 3 | 攒批消费线程 | 1（服务装配） | 服务装配代码 | `BatchScheduler.next_batch` 攒批 → 调 `score_batch` | `threading.Thread` + `threading.Condition` | `submit()` 的 `cond.notify()` 唤醒；超时（max_wait 窗口）自然醒 | 服务停止约定（当前为 daemon 随进程） |
-| 4 | 行为流消费线程 | 1（nearline 侧） | 服务装配代码 | 循环取行为事件 → `NearlineWorker.ingest` | `threading.Thread`（或外部 MQ 消费者） | 事件源（MQ/队列）唤醒 | 同上 |
-| 5 | 后端线程 | 视后端 | — | LocalKVStore 内部无独立线程（调用方线程内加锁）；datasystem/PS 的网络 IO 由其后端线程池承接 | — | — | — |
-
-> 说明：`LocalKVStore`/`LocalMetaStore`/`ShardedEmbeddingTable` 均为**被动对象**（无自有线程），其线程安全靠锁（见 7.4.6）。
-
-#### 7.4.2 实现方式（并发原语与数据结构）
-
-```python
-# dispatcher.py —— 核心并发数据结构
-class WorkerPool:
-    _queues: list[queue.Queue]      # N 个独立有界队列（maxsize=queue_capacity）
-    _workers: list[Thread]           # daemon 线程，target=_run
-    router: Router                   # jump 一致性哈希（worker_for 与 KV 分片同桶）
-    _on_done: Callable               # 完成回调（由 Dispatcher 注册为 _complete）
-
-class Dispatcher:
-    _seq: int                        # 单调递增请求号
-    _seq_lock: threading.Lock        # 保护 _seq（O(1) 临界区）
-    _inflight: dict[int, Future]     # req_seq → Future 异步匹配表
-    _inflight_lock: threading.Lock   # 保护 _inflight（O(1) 临界区）
-    _rr / _rr_lock                   # round_robin 模式的游标（hash 模式不用）
-
-# pipeline.py —— 攒批
-class BatchScheduler:
-    _queue: deque[ScoreRequest]      # FIFO 批队列
-    _cond: threading.Condition       # 生产/消费协同（notify + wait(timeout)）
-```
-
-**设计要点**：
-1. **消全局锁**：每 worker 一个独立队列，请求提交互不阻塞（对比「全局队列+单锁」会把所有提交串行化，队头阻塞放大 p99）；
-2. **按 user 串行化免费获得**：hash 路由使同一 user 的请求恒落同一 worker → 同一用户的 KV 读写天然有序，无需用户级锁；
-3. **有界队列 = 背压**：`put_nowait` 失败即拒绝（`OverloadRejected`），把过载信号异步传给调用方，而非无界排队拖垮时延；
-4. **乱序完成**：响应不需按提交顺序返回，`req_seq` 是唯一关联键——快速请求不被慢请求阻塞。
-
-#### 7.4.3 唤醒方式汇总
-
-| 阻塞点 | 阻塞线程 | 底层机制 | 唤醒触发 |
-|---|---|---|---|
-| `q.get()` | Worker 线程 | `queue.Queue` 内部 `not_empty` Condition | 提交方 `put/put_nowait` 入队成功 |
-| `fut.result()` | 客户端线程 | `Future` 内部 Condition | Worker 线程（经 `_complete`）`set_result` / `set_exception`；或背压路径 `set_exception(OverloadRejected)` |
-| `cond.wait()`（首条前） | 攒批消费线程 | `BatchScheduler._cond` | 生产线程 `submit()` → `notify()` |
-| `cond.wait(remaining)`（攒批窗口内） | 攒批消费线程 | 同上 + 超时参数 | 新请求 notify 提前唤醒（继续攒）或 `remaining` 耗尽自然醒（超时出批） |
-| `q.get()` 收到哨兵 | Worker 线程 | 同队列机制 | `stop()` 对每队列 `put(_STOP)` → worker `return` → `join()` |
-
-> 攒批窗口语义：`next_batch` 先**无限期等待首条**（保吞吐），首条到达后开始 `max_wait_seconds` 倒计时（保时延上界），窗口内继续攒到 `max_batch_size` 即满批出批。
-
-#### 7.4.4 协作方式（线程间如何配合）
-
-- **请求传递（生产者→消费者）**：客户端线程 → `queue.Queue` → Worker 线程；数据所有权随入队移交，worker 取出后独占处理（期间无锁）。
-- **响应传递（消费者→生产者）**：Worker 线程算完 → `_on_done(req, result, worker_id)` → `Dispatcher._complete` 查 `_inflight` 表 pop 出对应 Future → `set_result(Response)`（或 `set_exception`）→ 客户端线程从 `result()` 返回。**响应不排队、不经过共享队列**，直接点对点唤醒。
-- **乱序匹配协议**：`Request.req_seq` 由 Dispatcher 分配并随身携带；`Response.req_seq` 原样回带；`_inflight` 是唯一匹配表（pop 即完成移交，天然防重复完成）。
-- **背压协作**：队列满 → `try_enqueue` 返回 False → Dispatcher pop `_inflight` 并 `set_exception(OverloadRejected)`。调用方在 Future 上感知失败，自行决定重试/降级/打点——**提交方永不因过载被同步阻塞**（可选 `timeout` 限时阻塞模式）。
-- **异常传播**：Worker 主循环 `try: result = handler(req) except Exception as e: result = e`——handler 的异常不杀线程，作为「结果」交给 `_complete` → `set_exception` → 调用方在 `result()` 处感知。**worker 线程对业务异常免疫**。
-- **攒批协作**：多客户端线程并发 `submit`（cond 锁内 append + notify）→ 单消费线程 `next_batch` 攒批 → 批结果按展平顺序切分回各调用方（由上层编排层分发）。
-
-#### 7.4.5 具体请求端到端走读（在线打分，user="u1001"，M=200 候选）
-
-时序（左侧为执行线程；W2 = worker 2）：
-
-```
-客户端线程 C1                    Dispatcher                     Worker2（q2 空闲阻塞中）         KVStore(shard2)
-   │                                │                                │  ◀── q2.get() 阻塞          │
-   │── submit("u1001", payload) ───▶│                                │                             │
-   │                                │ ① seq=_alloc_seq()=42          │                             │
-   │                                │   [_seq_lock: +1, 纳秒级]       │                             │
-   │                                │ ② _inflight[42]=fut             │                             │
-   │                                │   [_inflight_lock: 1 次 dict 写]│                             │
-   │                                │ ③ w=worker_for("u1001")        │                             │
-   │                                │   =Router.route → jump 哈希 = 2 │                             │
-   │                                │ ④ q2.put_nowait(req) ──────────▶│  ◀── not_empty 唤醒          │
-   │◀── return fut ─────────────────│                                │                             │
-   │   （C1 此后可继续提交别的请求，    │                                │ ⑤ req = q2.get()            │
-   │     或阻塞在 fut.result()）      │                                │ ⑥ handler=OnlineWorker.score │
-   │                                │                                │   timing(online.kv_get):     │
-   │                                │                                │   get(KVKey(mv,"u1001")) ──▶│
-   │                                │                                │   ◀── UserKVRecord ─────────│
-   │                                │                                │   count(kv.hit)              │
-   │                                │                                │ ⑦ timing(online.encode_stage2):
-   │                                │                                │   kv=decode_record(rec)      │
-   │                                │                                │     # frombuffer 零拷贝视图   │
-   │                                │                                │   logits=score_ns(kv,ns_emb)│
-   │                                │                                │     # [200,2]，L 层交叉注意力  │
-   │                                │                                │ ⑧ _on_done(req,logits,2)     │
-   │                                │◀─ _complete(req_seq=42,...) ────│   # worker 立即回到 ⑤ 取下一条│
-   │                                │ ⑨ pop _inflight[42] → fut       │                             │
-   │                                │    fut.set_result(Response)     │                             │
-   │◀── fut.result() 唤醒 ───────────│                                 │                             │
-   │    = Response(req_seq=42,       │                                │                             │
-   │      user_id="u1001",           │                                │                             │
-   │      result=logits[200,2],      │                                │                             │
-   │      worker_id=2)               │                                │                             │
-```
-
-**并发交错示例**（证明乱序完成与背压）：C1 提交 u1001（seq=42→W2）后，C2 立即提交 u2002（seq=43→W0）。若 u2002 的 KV 更小、W0 更快，则 `Response(43)` 先于 `Response(42)` 完成——各 Future 独立，互不阻塞。若 W2 队列已满（cap=8，已积压 8 条），C1 的 `put_nowait` 失败 → `_inflight.pop(42)` → `fut.set_exception(OverloadRejected(42))` → C1 在 `result()` 处捕获，选择重试或降级，同时可打点 `overload` 指标。
-
-**攒批变体走读**：C1/C2/C3 分别 `BatchScheduler.submit`（各自 cond 锁内 append+notify）；消费线程被首条唤醒后开 5ms 窗口，窗口内凑齐 r1,r2,r3 → `score_batch` 一次 `mget(3 keys)`（shard 内聚合）+ 一次 `score_ns_batch` 前向（[ΣM,Ns,D]）→ `[ΣM,T]` → 编排层按各请求的 M 切分分发回各 Future。
-
-#### 7.4.6 锁与临界区分析
-
-| 锁 | 所属 | 保护对象 | 临界区 | 争用度 |
+| 池 | folly 类型 | 线程数（默认） | 职责 | **不做什么** |
 |---|---|---|---|---|
-| `_seq_lock` | Dispatcher | `_seq` 自增 | O(1)，纳秒 | 低（提交频率级） |
-| `_inflight_lock` | Dispatcher | `_inflight` dict 写/删 | O(1)，纳秒 | 低（每请求 2 次：注册+完成） |
-| `_rr_lock` | Dispatcher | round_robin 游标 | O(1) | 仅 rr 模式 |
-| 队列内部锁 ×N | WorkerPool | 各队列 ops | O(1)，纳秒 | 分散到 N 个队列，天然分片 |
-| `LocalKVStore._lock` | local 后端 | dict 写路径（put/append/delete） | put：持久化全程；append：反序列化+拼接+重序列化（微秒~毫秒） | 中（按 user 路由后已分散；生产由 datasystem 后端并发承接） |
-| `_locks[s]` ×S | ShardedEmbeddingTable | 单分片表读写 | O(1)，微秒 | 低（64 分片摊薄） |
-| `_cond` | BatchScheduler | deque 批队列 | O(批大小) | 低（攒批节奏） |
-| `LocalMetaStore._lock` | 元数据面 | 指针 dict | O(1) | 低 |
+| Ingress Pool | brpc 内置 bthread（M:N） | ≥核数 | accept、read body、JSON/protobuf 反序列化、提交下游、收结果后序列化 | 不查表 / 不读写 KV / 不前向 |
+| EmbedLookup Pool | `IOThreadPoolExecutor` | 4~8（按 PS 延迟） | item/user/artist/album 四表查表（远端 PS 为网络 I/O；本地表为轻 CPU）；nearline 与 online 共用 | 不做 MLP / 不前向 |
+| Frontend Encode Pool | `CPUThreadPoolExecutor` | 2~4 | dense 分箱 + S/NS 的 MLP + pos + RMSNorm → `s_emb`/`ns_emb` | 不查表（输入是已查好的 embedding）/ 不读写 KV / 不做注意力 |
+| KV I/O Pool | `IOThreadPoolExecutor` | 4~8（按 KV 延迟） | UserKV 的 get/mget/put（远端 KV 为网络 I/O；本地为内存+锁） | 不前向 / 不查 embedding |
+| Compute Pool | `CPUThreadPoolExecutor` | =物理核（绑核） | 两阶段重算：`encode_s`（nearline backbone prefill）/ `score_ns`+`score_ns_batch`（online 交叉注意力） | 不查表 / 不读写远端 KV（输入已就绪） |
+| Metrics/Timer 线程 | 单独 | 1 | 周期 flush 指标、TTL sweep、直方图快照 | 不在请求热路径 |
 
-**无锁路径**：worker 取到请求后的全部计算（`encode_s`/`score_ns`/张量操作）**无共享可变状态**（权重只读、UserKV 每请求独立对象）——计算时间是零锁占用的；`ServingMetrics` 依赖 CPython GIL 下 `defaultdict`/`list.append` 的原子性（轻量实现的已知取舍，生产替换为分桶无锁聚合）。
+> **为什么「不做什么」列重要**：它是防瓶颈的契约。例如「KV I/O Pool 不前向」保证了一次 50ms 的远端 KV 抖动不会占住 Compute Pool 的一个计算核，导致该核的排队劣化。
 
-#### 7.4.7 生产形态映射（brpc + bthread）
+#### 7.4.3 在线打分数据流（端到端阶段流）
 
-| Python 参照 | 生产 C++（brpc + bthread） | 语义对应 |
+```
+   brpc bthread (Ingress)            EmbedLookup Pool         Frontend Encode Pool
+         │ decode ScoreInput                │                       │
+         │── submit ScoreInput ───────────▶│ lookup(item/user/    │
+         │                                  │  artist/album)       │
+         │                                  │── raw emb ──────────▶│ encode_ns
+         │                                  │                       │ (dense+mlp+pos+RMSNorm)
+         │                                  │                       │  → ns_emb [M,Ns,D]
+         │                                  │                       │
+   KV I/O Pool ◀────────────────────────────────────────────────────│ ns_emb + KVKey
+         │ mget(UserKV) → recs(hit/miss)
+         │
+   Compute Pool ◀────────────────────────────────────────────────────│ (ns_emb, kvs)
+         │  BatchScheduler.next_batch() ← 多请求在此聚合
+         │  score_ns_batch (L 层交叉注意力+FFN) → logits [ΣM,T]
+         │── split 按各请求 M 回填 promise ──▶ Ingress: encode JSON resp
+```
+
+阶段顺序：**Lookup → Encode_NS → KV_mget → Score_batch**。Lookup 与 KV_mget 都是 I/O，被各自的 I/O 池承接；Encode_NS 与 Score 是 CPU，被 CPU 池承接。阶段间有界队列满 → 上游 backpressure → 最终 Ingress 以 429/503 快速拒绝，或降级。
+
+#### 7.4.4 近线 ingest 数据流
+
+```
+   brpc bthread (Ingress)         EmbedLookup Pool         Frontend Encode Pool
+         │ decode IngestInput           │                       │
+         │── submit ──────────────────▶│ lookup(item 序列表)    │
+         │                              │── item emb ─────────▶│ encode_s
+         │                              │                       │ (mlp+type+pos+RMSNorm)
+         │                              │                       │  → s_emb [1,S0,D]
+         │                              │                       │
+   Compute Pool ◀──────────────────────────────────────────────│ s_emb
+         │  TwoStageRunner.encode_s (L 层 prefill) → 逐层 K/V
+         │── UserKV ────────────────▶ KV I/O Pool
+                                       │ kv_serialize + put(UserKV)
+                                       │── accepted ──▶ Ingress: encode JSON resp
+```
+
+> nearline 的 Encode_S（前端）轻、Compute 的 `encode_s`（backbone）重，故前端 encode 与 backbone 分别落 Frontend Encode Pool 与 Compute Pool，避免轻 MLP 任务挤占绑核计算线程。
+
+#### 7.4.5 阶段间协作与背压
+
+- **串联原语**：每个阶段用 `folly::Future<T>` 串联；上一步 `via(executor).then(...)` 派发到下一步的 executor，保证「在哪个池跑」显式可控，不串到默认 executor。
+- **有界队列**：每阶段入口 `bounded queue（容量 cap）`；满时上游 `Future` 失败（或限时阻塞），信号逐级回传至 Ingress → 快速拒绝（HTTP 429）或降级。
+- **数据所有权**：阶段间传递的是张量/记录的所有权（move），无共享可变状态；Compute Pool 内权重只读、UserKV 每请求独立对象，**计算阶段零锁**。
+- **乱序与 req 关联**：每请求一个 `promise<ScoreOutcome>`；结果不按提交顺序回填（`req_id` 关联），快请求不被慢请求阻塞。
+
+#### 7.4.6 攒批节点（Compute Pool 入口）
+
+`BatchScheduler` 挂在 Compute Pool 的 Online 入口（不挂 KV 入口——KV miss 行需参与降级判定）。语义沿用既有契约：
+
+- **无限期等首条**（保吞吐）→ 首条到后开 `max_wait` 窗口（保时延上界）→ 窗口内凑满 `max_batch` 即出批；超时出当前存量。
+- 出批后一次 `score_ns_batch`：内部已就绪的 (ns_emb, UserKV) 打包为 `[ΣM,Ns,D]` 单次前向；miss 行在回填阶段置全零 logits（G8），**顺序与批次一致**。
+- Compute Pool 多线程消费批次：每线程取一个 batch 独立前向（权重只读、KV 独立），天然并行无锁。
+
+#### 7.4.7 锁与临界区分析
+
+| 锁/结构 | 所属 | 保护对象 | 临界区 | 争用度 |
+|---|---|---|---|---|
+| brpc `max_concurrency` | Ingress | 在处理请求数 | O(1) | 中（限流点） |
+| 阶段入口有界队列 ×K | 各 Pool | FIFO 批队列 | O(批大小) | 分散到 K 池 |
+| `LocalKVStore._lock` | KV（本地后端） | dict 写路径 | put：序列化+写；mget：只读 | 中（按 user 路由已分散） |
+| Embedding 表分片锁 ×S | Lookup | 单分片表读写 | O(1) 微秒 | 低（分片摊薄） |
+| `BatchScheduler._cond` | Compute 入口 | 攒批 deque | O(批大小) | 低（攒批节奏） |
+| `Metrics._mu` | 指标 | values map | O(1) | 低（可换 lock-free） |
+
+**无锁路径**：自 Lookup 出口之后、序列化之前的全部张量计算（encode_ns / score_ns）**无共享可变状态**——这是分阶段流水线的核心收益：把 I/O 锁与 CPU 计算彻底解耦。
+
+#### 7.4.8 与 LLM 推理服务的线程模型差异
+
+Stage II 非自回归（M 候选整批并行、单次前向出全部分数），无逐 token 循环与 continuous batching 的调度复杂度；并发重心是「高并发读 KV + 交叉注意力吞吐 + 数据本地性」，而非 decode 的 token 级流水。因此**不需要 PD 分池**（prefill/decode 分离调度），只需要 I/O vs CPU 的功能分池。
+
+#### 7.4.9 当前实现映射（`cpp/` 现状 → 目标）
+
+| 目标阶段 | 当前 `cpp/` 落点 | 状态 |
 |---|---|---|
-| `Dispatcher.submit` | RPC 入口 handler（bthread 承载，M:N 调度） | 每请求一个 bthread，提交即返回 Controller/done |
-| `WorkerPool` N 队列 | `ExecutionQueue`/每 worker 有界队列 + bthread 工作组 | 独立队列消全局锁 |
-| `Future` + `_inflight[req_seq]` | brpc `Controller` + `done` 回调 / `bthread_id` | 异步匹配、乱序完成、超时（timeout_ms） |
-| `try_enqueue` Full → `OverloadRejected` | `max_concurrency` 限流 + 快速拒绝（ELOGOFF/ELIMIT） | 背压 |
-| `_STOP` 哨兵 + `join` | `Server.Stop(...)`（先停收新请求，再 drain 队列） | 优雅停机（drain & wait 语义） |
-| `LocalKVStore._lock` | datasystem 后端并发（分片锁/无锁结构） | 存储层承接 |
-| `BatchScheduler` | 服务端 dynamic batching（或 brpc 批量接口 + 合并器） | 满批或超时 |
+| Ingress | [net/http_server](file:///workspace/cpp/src/net/http_server.cpp) accept 线程 + worker 池 | 已分离接入与 accept；但 `/score` 在 http worker 内 `fut.get()` 同步等待，**需改为提交后异步回调** |
+| EmbedLookup | [serving/embed_lookup](file:///workspace/cpp/src/serving/embed_lookup.cpp)（`LookupFn` 回调，本地表） | 已是回调可注入；当前在 `score_batch` 内同步调用，**需迁出到独立 I/O 池** |
+| Frontend Encode | [engine/frontend](file:///workspace/cpp/src/engine/frontend.cpp)（encode_s/encode_ns） | 已实现；当前与 compute 同线程，**需迁出到 Frontend Encode 池** |
+| KV I/O | [kv/store](file:///workspace/cpp/src/kv/store.cpp)（LocalKVStore，带锁） | 已实现 TTL/mget；当前在 `score_batch`/`ingest` 内同步，**需迁出到独立 I/O 池** |
+| Compute | [serving/pipeline](file:///workspace/cpp/src/serving/pipeline.cpp) Dispatcher + BatchScheduler + score_ns_batch | **已分池**（score_threads 独立消费 batch） |
+| 阶段串联 | 无（各阶段在同一线程内串行） | **待引入** folly executor + Future 串联 |
 
-**与 LLM 推理服务的线程模型差异**：Stage II 非自回归（M 候选整批并行、单次前向出全部分数），无逐 token 循环与 continuous batching 的调度复杂度；并发重心是「高并发读 KV + 交叉注意力吞吐 + 数据本地性」，而非 decode 的 token 级流水。
+即：当前 `cpp/` 已实现「接入/计算分离 + 攒批」，但 lookup/KV/encode 仍在 compute 线程内同步；下一阶段引入 folly 分池与 Future 串联，把 I/O 与 CPU 彻底解耦。
 
 ### 7.5 关键数据结构
 
